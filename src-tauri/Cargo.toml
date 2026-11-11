@@ -1,0 +1,40 @@
+[package]
+name = "youtube-music-rust"
+version = "0.1.0"
+description = "Ultra-lightweight YouTube Music desktop client in Rust and Tauri v2 (Zero-WebView Background Mode)"
+authors = ["Joao Accioly"]
+edition = "2021"
+
+[lib]
+name = "youtube_music_rust_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rodio = { version = "0.19", default-features = false, features = ["symphonia-all", "vorbis"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "io-util"] }
+sha1 = "0.10"
+
+[patch.crates-io]
+rodio = { path = "vendor/rodio-0.19.0" }
+
+[profile.dev]
+debug = 0
+strip = "debuginfo"
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 1
+debug = false
+
+[profile.release]
+debug = false
+strip = true
+lto = false
+codegen-units = 4

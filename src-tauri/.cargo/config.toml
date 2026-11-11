@@ -1,0 +1,3 @@
+[build]
+# Limit parallel rustc jobs to 2 so compiling never spikes CPU temperature or exhausts laptop RAM
+jobs = 2
