@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import { CheckCircle2, ExternalLink, KeyRound, LogOut, ShieldCheck, X } from 'lucide-vue-next'
 import { usePlayerStore } from '../stores/player'
 
-defineProps<{
+const props = defineProps<{
   open: boolean
 }>()
 
@@ -14,6 +15,32 @@ const emit = defineEmits<{
 const player = usePlayerStore()
 const manualCookieInput = ref('')
 const manualCookieSuccess = ref(false)
+const authFilePath = ref('~/.local/share/com.ytmusic.rust/auth.json')
+
+async function refreshAuthFilePath() {
+  if (!player.isTauriConnected) return
+  try {
+    const resolved = await invoke<string>('get_auth_file_path_str')
+    if (resolved) {
+      authFilePath.value = resolved
+    }
+  } catch {
+    // Keep default fallback path in browser preview
+  }
+}
+
+onMounted(() => {
+  refreshAuthFilePath()
+})
+
+watch(
+  () => [props.open, player.isTauriConnected] as const,
+  ([isOpen, connected]) => {
+    if (isOpen && connected) {
+      refreshAuthFilePath()
+    }
+  }
+)
 
 async function handleSaveManualCookie() {
   if (!manualCookieInput.value.trim()) return
@@ -89,8 +116,8 @@ async function handleSaveManualCookie() {
                   : 'Modo visitante ativo'
               }}
             </p>
-            <p class="text-[11px] text-[#6E6885] dark:text-[#9B94B2] truncate">
-              Sessão local segura: <code>~/.local/share/com.ytmusic.rust/auth.json</code>
+            <p class="text-[11px] text-[#6E6885] dark:text-[#9B94B2] truncate" :title="authFilePath">
+              Sessão local segura: <code>{{ authFilePath }}</code>
             </p>
           </div>
         </div>

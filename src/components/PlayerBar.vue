@@ -21,12 +21,18 @@ import {
 } from 'lucide-vue-next'
 import { formatTime, getPastelGradient, usePlayerStore } from '../stores/player'
 
+const props = defineProps<{
+  lyricsOpen?: boolean
+}>()
+
 const emit = defineEmits<{
   (e: 'open-lyrics-view'): void
 }>()
 
 const player = usePlayerStore()
 const previousVolume = ref(0.8)
+const isSeeking = ref(false)
+const seekPreviewSecs = ref(0)
 
 const currentGradient = computed(() =>
   getPastelGradient((player.videoId || '') + (player.currentTrackTitle || ''))
@@ -34,9 +40,13 @@ const currentGradient = computed(() =>
 
 const isCurrentLiked = computed(() => player.isTrackLiked(player.videoId))
 
+const displayedPositionSecs = computed(() =>
+  isSeeking.value ? seekPreviewSecs.value : player.positionSecs
+)
+
 const progressPercent = computed(() => {
   const dur = player.durationSecs || 1
-  return Math.min(100, Math.max(0, (player.positionSecs / dur) * 100))
+  return Math.min(100, Math.max(0, (displayedPositionSecs.value / dur) * 100))
 })
 
 const repeatLabel = computed(() => {
@@ -56,15 +66,22 @@ function handleVolumeInput(event: Event) {
   }, 40)
 }
 
-let seekDebounceTimer: ReturnType<typeof setTimeout> | null = null
+function handleSeekStart() {
+  isSeeking.value = true
+  seekPreviewSecs.value = player.positionSecs
+}
+
 function handleSeekInput(event: Event) {
   const target = event.target as HTMLInputElement
+  isSeeking.value = true
+  seekPreviewSecs.value = parseFloat(target.value)
+}
+
+function handleSeekCommit(event: Event) {
+  const target = event.target as HTMLInputElement
   const val = parseFloat(target.value)
-  player.positionSecs = val
-  if (seekDebounceTimer) clearTimeout(seekDebounceTimer)
-  seekDebounceTimer = setTimeout(() => {
-    player.seekTo(val)
-  }, 40)
+  isSeeking.value = false
+  player.seekTo(val)
 }
 
 function toggleMute() {
@@ -138,7 +155,7 @@ function toggleMute() {
               {{ player.currentTrackTitle }}
             </p>
             <p class="text-[11px] text-[#A89FC4] truncate tabular-nums">
-              {{ player.currentTrackArtist }} • {{ formatTime(player.positionSecs) }} /
+              {{ player.currentTrackArtist }} • {{ formatTime(displayedPositionSecs) }} /
               {{ formatTime(player.durationSecs) }}
             </p>
           </div>
@@ -229,7 +246,7 @@ function toggleMute() {
             title="Letra sincronizada"
             :class="[
               'p-1.5 rounded-full transition-colors',
-              player.rightPanelOpen && player.rightPanelTab === 'lyrics'
+              props.lyricsOpen || (player.rightPanelOpen && player.rightPanelTab === 'lyrics')
                 ? 'bg-[#8B6EFF]/30 text-[#DDD6FE]'
                 : 'text-[#A89FC4] hover:text-white hover:bg-white/10',
             ]"
@@ -316,8 +333,11 @@ function toggleMute() {
           :min="0"
           :max="player.durationSecs || 1"
           step="0.5"
-          :value="player.positionSecs"
+          :value="displayedPositionSecs"
+          @pointerdown="handleSeekStart"
+          @touchstart="handleSeekStart"
           @input="handleSeekInput"
+          @change="handleSeekCommit"
           aria-label="Progresso da música"
           class="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
         />

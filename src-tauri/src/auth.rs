@@ -358,9 +358,17 @@ pub fn open_google_login_window(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Checks for an exact Google session cookie name (avoiding false positives like `SAPISID` matching `SID=`).
+pub fn is_session_login_cookie_name(name: &str) -> bool {
+    matches!(
+        name,
+        "SID" | "HSID" | "__Secure-1PSID" | "__Secure-3PSID" | "LOGIN_INFO"
+    )
+}
+
 /// Polls the temporary `"google-login"` WebView window's cookie store every 1500ms while open.
-/// As soon as `SAPISID` or `__Secure-3PAPISID` is detected, persists the session, updates `AppContainer`,
-/// emits `auth-state-changed`, and destroys the `"google-login"` window to free RAM.
+/// As soon as `SAPISID` and a real Google session cookie are detected, persists the session,
+/// updates `AppContainer`, emits `auth-state-changed`, and destroys the `"google-login"` window to free RAM.
 fn spawn_login_cookie_watcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let Ok(ytm_url) = "https://music.youtube.com".parse::<tauri::Url>() else {
@@ -379,14 +387,21 @@ fn spawn_login_cookie_watcher(app: AppHandle) {
             };
 
             let mut cookie_pairs: Vec<String> = Vec::new();
+            let mut has_login_cookie = false;
 
             if let Ok(cookies) = login_win.cookies_for_url(ytm_url.clone()) {
                 for c in cookies {
+                    if is_session_login_cookie_name(c.name()) && !c.value().is_empty() {
+                        has_login_cookie = true;
+                    }
                     cookie_pairs.push(format!("{}={}", c.name(), c.value()));
                 }
             }
             if let Ok(cookies) = login_win.cookies_for_url(yt_url.clone()) {
                 for c in cookies {
+                    if is_session_login_cookie_name(c.name()) && !c.value().is_empty() {
+                        has_login_cookie = true;
+                    }
                     let entry = format!("{}={}", c.name(), c.value());
                     if !cookie_pairs.contains(&entry) {
                         cookie_pairs.push(entry);
@@ -399,11 +414,6 @@ fn spawn_login_cookie_watcher(app: AppHandle) {
             }
 
             let combined = cookie_pairs.join("; ");
-            // Wait until both SAPISID and a session identifier (like SID, HSID, __Secure-1PSID, or LOGIN_INFO) exist
-            let has_login_cookie = combined.contains("SID=")
-                || combined.contains("__Secure-1PSID=")
-                || combined.contains("__Secure-3PSID=")
-                || combined.contains("LOGIN_INFO=");
 
             if has_login_cookie {
                 if let Ok(session) = build_session_from_cookie_str(&combined, "webview") {
@@ -599,5 +609,19 @@ mod tests {
                 "Expected URL to be blocked: {raw}"
             );
         }
+    }
+
+    #[test]
+    fn test_is_session_login_cookie_name_exact_match() {
+        assert!(is_session_login_cookie_name("SID"));
+        assert!(is_session_login_cookie_name("HSID"));
+        assert!(is_session_login_cookie_name("__Secure-1PSID"));
+        assert!(is_session_login_cookie_name("__Secure-3PSID"));
+        assert!(is_session_login_cookie_name("LOGIN_INFO"));
+
+        // Must NOT match SAPISID or partial substrings
+        assert!(!is_session_login_cookie_name("SAPISID"));
+        assert!(!is_session_login_cookie_name("__Secure-3PAPISID"));
+        assert!(!is_session_login_cookie_name("PREF"));
     }
 }

@@ -42,11 +42,14 @@ const navItems: Array<{ id: 'home' | 'explore' | 'library' | 'liked'; label: str
 ]
 
 const accountInitial = computed(() => {
+  if (!player.authStatus.is_authenticated) {
+    return 'V'
+  }
   const hint = (player.authStatus.account_hint || '').trim()
   if (hint && hint !== 'Não conectado') {
     return hint.charAt(0).toUpperCase()
   }
-  return 'G'
+  return 'U'
 })
 
 function onSubmit() {
@@ -193,7 +196,9 @@ function handleLogoClick() {
         <span
           :class="[
             'absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full ring-2 ring-[#F7F6FA] dark:ring-[#12101B]',
-            player.authStatus.is_authenticated ? 'bg-[#22C55E]' : 'bg-[#10B981]',
+            player.authStatus.is_authenticated
+              ? 'bg-[#22C55E]'
+              : 'bg-[#9B94B2] dark:bg-[#6E6885]',
           ]"
         ></span>
       </button>

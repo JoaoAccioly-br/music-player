@@ -13,8 +13,8 @@ use auth::{
 };
 use innertube::{
     fetch_home, fetch_liked_music, fetch_playlist_tracks, fetch_radio_up_next, fetch_track_lyrics,
-    fetch_user_playlists, search_music_filtered, HomeSection, LyricsResponse, PlaylistItem,
-    TrackItem,
+    fetch_user_playlists, search_music_filtered, set_track_like_status, HomeSection,
+    LyricsResponse, PlaylistItem, TrackItem,
 };
 use persistence::{load_persisted_session, save_persisted_session, PersistedSession};
 use serde::{Deserialize, Serialize};
@@ -205,6 +205,7 @@ impl PlayerState {
 pub struct AppContainer {
     pub player: Mutex<PlayerState>,
     pub queue: Mutex<Vec<TrackItem>>,
+    pub liked_tracks: Mutex<Vec<TrackItem>>,
     pub auth: Mutex<AuthSession>,
     pub audio_engine: AudioEngine,
     pub active_buffer: Mutex<Option<ProgressiveAudioBuffer>>,
@@ -222,6 +223,7 @@ impl Default for AppContainer {
         let audio_engine = AudioEngine::new();
         let mut player_state = PlayerState::default();
         let mut initial_queue = default_queue_tracks();
+        let mut initial_liked_tracks = Vec::new();
 
         if let Some(persisted) = load_persisted_session() {
             let vol = persisted.volume.clamp(0.0, 1.0);
@@ -239,12 +241,14 @@ impl Default for AppContainer {
             if !persisted.queue.is_empty() {
                 initial_queue = persisted.queue;
             }
+            initial_liked_tracks = persisted.liked_tracks;
             player_state.apply_track_from_queue(&initial_queue, persisted.queue_index);
         }
 
         Self {
             player: Mutex::new(player_state),
             queue: Mutex::new(initial_queue),
+            liked_tracks: Mutex::new(initial_liked_tracks),
             auth: Mutex::new(initial_auth),
             audio_engine,
             active_buffer: Mutex::new(None),
@@ -258,28 +262,40 @@ impl Default for AppContainer {
     }
 }
 
-/// Persists the current player state and queue to `~/.local/share/com.ytmusic.rust/player_session.json`.
+/// Persists the current player state, queue, and liked tracks to `<app_data_dir>/player_session.json`.
 fn persist_current_session(app: &AppHandle) {
     let Some(container) = app.try_state::<AppContainer>() else {
         return;
     };
-    let Ok(state) = container.player.lock() else {
-        return;
+    // Acquire player, queue, and liked_tracks separately (never nested) to avoid AB-BA deadlock
+    let state_snapshot = {
+        let Ok(state) = container.player.lock() else {
+            return;
+        };
+        state.clone()
     };
-    let Ok(queue) = container.queue.lock() else {
-        return;
+    let queue_snapshot = {
+        let Ok(queue) = container.queue.lock() else {
+            return;
+        };
+        queue.clone()
+    };
+    let liked_snapshot = {
+        let Ok(liked) = container.liked_tracks.lock() else {
+            return;
+        };
+        liked.clone()
     };
     let session = PersistedSession {
-        volume: state.volume,
-        repeat_mode: state.repeat_mode.as_str().to_string(),
-        autoplay_radio: state.autoplay_radio,
-        low_ram_no_images: state.low_ram_no_images,
+        volume: state_snapshot.volume,
+        repeat_mode: state_snapshot.repeat_mode.as_str().to_string(),
+        autoplay_radio: state_snapshot.autoplay_radio,
+        low_ram_no_images: state_snapshot.low_ram_no_images,
         theme: "dark".to_string(),
-        queue: queue.clone(),
-        queue_index: state.queue_index,
+        queue: queue_snapshot,
+        queue_index: state_snapshot.queue_index,
+        liked_tracks: liked_snapshot,
     };
-    drop(queue);
-    drop(state);
     save_persisted_session(&session);
 }
 
@@ -711,6 +727,9 @@ fn spawn_track_loader(
 /// current queue reaches the end, appending the new tracks and seamlessly starting the next song.
 fn spawn_radio_continuation(app: AppHandle, seed_video_id: String) {
     let auth_opt = current_auth_snapshot(&app);
+    let expected_gen_opt = app
+        .try_state::<AppContainer>()
+        .map(|c| c.download_generation.load(Ordering::SeqCst));
     tauri::async_runtime::spawn(async move {
         let radio_tracks = fetch_radio_up_next(&seed_video_id, auth_opt.as_ref())
             .await
@@ -720,42 +739,67 @@ fn spawn_radio_continuation(app: AppHandle, seed_video_id: String) {
             return;
         };
 
-        let mut updated_queue = Vec::new();
-        let mut next_play_info: Option<(PlayerState, String, usize, f64)> = None;
-
-        {
-            if let Ok(mut q_guard) = container.queue.lock() {
-                let first_new_index = q_guard.len();
-                let mut existing_ids: HashSet<String> =
-                    q_guard.iter().map(|t| t.video_id.clone()).collect();
-                for track in radio_tracks {
-                    if existing_ids.insert(track.video_id.clone()) {
-                        q_guard.push(track);
-                    }
-                }
-                // If all tracks were already in the queue, wrap around or append fallback
-                let target_index = if first_new_index < q_guard.len() {
-                    first_new_index
-                } else {
-                    0
-                };
-                updated_queue = q_guard.clone();
-
-                if let Ok(mut state) = container.player.lock() {
-                    state.apply_track_from_queue(&updated_queue, target_index);
-                    state.is_loading = true;
-                    state.is_playing = true;
-                    state.audio_quality_label =
-                        "Rádio Autoplay (/youtubei/v1/next) • Carregando...".to_string();
-                    next_play_info = Some((
-                        state.clone(),
-                        state.video_id.clone(),
-                        state.queue_index,
-                        state.duration_secs,
-                    ));
-                }
+        if let Some(expected_gen) = expected_gen_opt {
+            if container.download_generation.load(Ordering::SeqCst) != expected_gen {
+                return;
             }
         }
+
+        // Verify player is still awaiting radio continuation for `seed_video_id` before mutating queue
+        {
+            let Ok(state) = container.player.lock() else {
+                return;
+            };
+            if state.video_id != seed_video_id || !state.is_loading {
+                return;
+            }
+        }
+
+        let (updated_queue, target_index) = {
+            let Ok(mut q_guard) = container.queue.lock() else {
+                return;
+            };
+            let first_new_index = q_guard.len();
+            let mut existing_ids: HashSet<String> =
+                q_guard.iter().map(|t| t.video_id.clone()).collect();
+            for track in radio_tracks {
+                if existing_ids.insert(track.video_id.clone()) {
+                    q_guard.push(track);
+                }
+            }
+            // If all tracks were already in the queue, wrap around to index 0
+            let target_idx = if first_new_index < q_guard.len() {
+                first_new_index
+            } else {
+                0
+            };
+            (q_guard.clone(), target_idx)
+        };
+
+        let next_play_info = {
+            let Ok(mut state) = container.player.lock() else {
+                return;
+            };
+            if let Some(expected_gen) = expected_gen_opt {
+                if container.download_generation.load(Ordering::SeqCst) != expected_gen {
+                    return;
+                }
+            }
+            if state.video_id != seed_video_id || !state.is_loading {
+                return;
+            }
+            state.apply_track_from_queue(&updated_queue, target_index);
+            state.is_loading = true;
+            state.is_playing = true;
+            state.audio_quality_label =
+                "Rádio Autoplay (/youtubei/v1/next) • Carregando...".to_string();
+            Some((
+                state.clone(),
+                state.video_id.clone(),
+                state.queue_index,
+                state.duration_secs,
+            ))
+        };
 
         if !updated_queue.is_empty() {
             broadcast_queue_change(&app, &updated_queue);
@@ -792,7 +836,15 @@ fn start_progress_ticker(app: AppHandle) {
 
             {
                 if let Ok(mut state) = container.player.lock() {
-                    if state.is_playing && !state.is_loading {
+                    if let Some(audio_err) = container.audio_engine.take_last_error() {
+                        state.is_playing = false;
+                        state.is_loading = false;
+                        state.error_message = Some(audio_err);
+                        state.audio_quality_label =
+                            "Erro no dispositivo/decodificador de áudio".to_string();
+                        track_transitioned = true;
+                        updated_state = Some(state.clone());
+                    } else if state.is_playing && !state.is_loading {
                         let real_pos = container.audio_engine.get_position_secs();
                         if real_pos > 0.0 {
                             state.position_secs = real_pos;
@@ -813,8 +865,10 @@ fn start_progress_ticker(app: AppHandle) {
                             }
                         }
 
+                        // Only rely on duration_secs timer fallback when no real hardware Sink is active
                         let track_finished = container.audio_engine.is_track_finished()
-                            || (state.duration_secs > 0.0
+                            || (!container.audio_engine.has_active_track()
+                                && state.duration_secs > 0.0
                                 && state.position_secs >= state.duration_secs);
 
                         if track_finished {
@@ -1174,6 +1228,47 @@ fn get_queue(container: State<'_, AppContainer>) -> Vec<TrackItem> {
 }
 
 #[tauri::command]
+fn add_to_queue(
+    app: AppHandle,
+    container: State<'_, AppContainer>,
+    track: TrackItem,
+) -> Vec<TrackItem> {
+    let trimmed_id = track.video_id.trim();
+    if trimmed_id.is_empty() {
+        return get_queue(container);
+    }
+
+    let (updated_queue, new_len) = {
+        let Ok(mut q_guard) = container.queue.lock() else {
+            return Vec::new();
+        };
+        if !q_guard.iter().any(|t| t.video_id == trimmed_id) && q_guard.len() < 500 {
+            q_guard.push(track);
+        }
+        (q_guard.clone(), q_guard.len())
+    };
+
+    let (updated_state, should_prefetch) = {
+        let Ok(mut state) = container.player.lock() else {
+            return updated_queue;
+        };
+        state.queue_len = new_len;
+        let prefetch = !state.is_loading
+            && state.buffer_size_mb > 0.0
+            && state.queue_index + 1 < new_len;
+        (state.clone(), prefetch)
+    };
+
+    broadcast_queue_change(&app, &updated_queue);
+    broadcast_state_change(&app, &updated_state);
+    persist_current_session(&app);
+    if should_prefetch {
+        spawn_prefetch_next_track(app);
+    }
+    updated_queue
+}
+
+#[tauri::command]
 fn play_queue_index(
     app: AppHandle,
     container: State<'_, AppContainer>,
@@ -1492,14 +1587,82 @@ async fn get_track_lyrics(
 }
 
 #[tauri::command]
-async fn get_liked_music(container: State<'_, AppContainer>) -> Result<Vec<TrackItem>, String> {
+fn get_auth_file_path_str() -> String {
+    auth::get_auth_file_path().to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn toggle_like_track(
+    app: AppHandle,
+    container: State<'_, AppContainer>,
+    track: TrackItem,
+) -> Vec<TrackItem> {
+    let vid = track.video_id.trim().to_string();
+    if vid.is_empty() {
+        return container
+            .liked_tracks
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+    }
+
+    let (updated_liked, is_now_liked) = {
+        let Ok(mut guard) = container.liked_tracks.lock() else {
+            return Vec::new();
+        };
+        if let Some(pos) = guard.iter().position(|t| t.video_id == vid) {
+            guard.remove(pos);
+            (guard.clone(), false)
+        } else {
+            guard.insert(0, track);
+            if guard.len() > 500 {
+                guard.truncate(500);
+            }
+            (guard.clone(), true)
+        }
+    };
+
+    persist_current_session(&app);
+
+    if let Some(auth) = current_auth_snapshot(&app) {
+        tauri::async_runtime::spawn(async move {
+            let _ = set_track_like_status(&vid, is_now_liked, &auth).await;
+        });
+    }
+
+    updated_liked
+}
+
+#[tauri::command]
+async fn get_liked_music(
+    app: AppHandle,
+    container: State<'_, AppContainer>,
+) -> Result<Vec<TrackItem>, String> {
     let auth_opt = container
         .auth
         .lock()
         .ok()
-        .filter(|a| a.is_authenticated)
+        .filter(|a| a.is_authenticated && !a.sapisid.is_empty())
         .map(|a| a.clone());
-    fetch_liked_music(auth_opt.as_ref()).await
+
+    if let Some(auth) = auth_opt {
+        let tracks = fetch_liked_music(Some(&auth)).await?;
+        if !tracks.is_empty() {
+            if let Ok(mut guard) = container.liked_tracks.lock() {
+                *guard = tracks.clone();
+            }
+            persist_current_session(&app);
+        }
+        return Ok(tracks);
+    }
+
+    // Guest mode: preserve user's locally liked tracks across tab switches & restarts
+    let local_liked = container
+        .liked_tracks
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    Ok(local_liked)
 }
 
 #[tauri::command]
@@ -1670,6 +1833,7 @@ pub fn run() {
             seek_to,
             play_youtube_video,
             get_queue,
+            add_to_queue,
             play_queue_index,
             remove_from_queue,
             clear_queue,
@@ -1678,6 +1842,7 @@ pub fn run() {
             toggle_autoplay_radio,
             toggle_low_ram_images,
             get_auth_status,
+            get_auth_file_path_str,
             open_login_window,
             set_manual_cookie,
             logout_auth,
@@ -1685,6 +1850,7 @@ pub fn run() {
             search_youtube_music,
             search_ytm,
             get_track_lyrics,
+            toggle_like_track,
             get_liked_music,
             get_user_playlists,
             get_playlist_tracks,

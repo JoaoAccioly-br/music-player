@@ -1,9 +1,10 @@
 use crate::innertube::TrackItem;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
-/// Lightweight player session persisted to `~/.local/share/com.ytmusic.rust/player_session.json`
+/// Lightweight player session persisted to `<app_data_dir>/player_session.json`
 /// with strict `0600` file permissions on Unix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSession {
@@ -14,6 +15,8 @@ pub struct PersistedSession {
     pub theme: String,
     pub queue: Vec<TrackItem>,
     pub queue_index: usize,
+    #[serde(default)]
+    pub liked_tracks: Vec<TrackItem>,
 }
 
 impl Default for PersistedSession {
@@ -26,12 +29,13 @@ impl Default for PersistedSession {
             theme: "dark".to_string(),
             queue: Vec::new(),
             queue_index: 0,
+            liked_tracks: Vec::new(),
         }
     }
 }
 
 /// Resolves the cross-platform application local data directory:
-/// - Linux/BSD: `~/.local/share/com.ytmusic.rust` (or `$XDG_DATA_HOME/com.ytmusic.rust`)
+/// - Linux/BSD: `$XDG_DATA_HOME/com.ytmusic.rust` (or `~/.local/share/com.ytmusic.rust`)
 /// - Windows: `%LOCALAPPDATA%\com.ytmusic.rust` (or `%APPDATA%\com.ytmusic.rust`)
 /// - macOS: `~/Library/Application Support/com.ytmusic.rust`
 pub fn get_app_data_dir() -> PathBuf {
@@ -81,17 +85,17 @@ pub fn get_app_data_dir() -> PathBuf {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
+            if !xdg_data.trim().is_empty() {
+                return PathBuf::from(xdg_data).join("com.ytmusic.rust");
+            }
+        }
         if let Ok(home) = std::env::var("HOME") {
             if !home.trim().is_empty() {
                 return PathBuf::from(home)
                     .join(".local")
                     .join("share")
                     .join("com.ytmusic.rust");
-            }
-        }
-        if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
-            if !xdg_data.trim().is_empty() {
-                return PathBuf::from(xdg_data).join("com.ytmusic.rust");
             }
         }
         PathBuf::from(".")
@@ -106,7 +110,7 @@ pub fn get_session_file_path() -> PathBuf {
     get_app_data_dir().join("player_session.json")
 }
 
-/// Loads the persisted player session from `~/.local/share/com.ytmusic.rust/player_session.json` if present and valid.
+/// Loads the persisted player session from `<app_data_dir>/player_session.json` if present and valid.
 /// Normalizes and clamps persisted session fields to valid bounds and defaults.
 pub fn normalize_persisted_session(mut session: PersistedSession) -> PersistedSession {
     session.volume = session.volume.clamp(0.0, 1.0);
@@ -122,6 +126,14 @@ pub fn normalize_persisted_session(mut session: PersistedSession) -> PersistedSe
     if !session.queue.is_empty() && session.queue_index >= session.queue.len() {
         session.queue_index = 0;
     }
+    let mut seen_liked = HashSet::new();
+    session.liked_tracks.retain(|track| {
+        let vid = track.video_id.trim();
+        !vid.is_empty() && seen_liked.insert(vid.to_string())
+    });
+    if session.liked_tracks.len() > 500 {
+        session.liked_tracks.truncate(500);
+    }
     session
 }
 
@@ -132,7 +144,7 @@ pub fn load_persisted_session() -> Option<PersistedSession> {
     Some(normalize_persisted_session(session))
 }
 
-/// Saves `PersistedSession` to `~/.local/share/com.ytmusic.rust/player_session.json` with `0700` directory
+/// Saves `PersistedSession` to `<app_data_dir>/player_session.json` with `0700` directory
 /// and `0600` file permissions on Unix without TOCTOU race condition.
 pub fn save_persisted_session(session: &PersistedSession) {
     let path = get_session_file_path();
@@ -200,6 +212,7 @@ mod tests {
         assert_eq!(def.theme, "dark");
         assert!(def.queue.is_empty());
         assert_eq!(def.queue_index, 0);
+        assert!(def.liked_tracks.is_empty());
     }
 
     #[test]
@@ -281,5 +294,39 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(empty_queue.queue_index, 4);
+    }
+
+    #[test]
+    fn test_persisted_session_backwards_compatible_without_liked_tracks_and_dedup() {
+        let legacy_json = r#"{
+            "volume": 0.65,
+            "repeat_mode": "one",
+            "autoplay_radio": false,
+            "low_ram_no_images": true,
+            "theme": "light",
+            "queue": [],
+            "queue_index": 0
+        }"#;
+        let parsed: PersistedSession = serde_json::from_str(legacy_json)
+            .expect("legacy session JSON without liked_tracks must deserialize");
+        let normalized = normalize_persisted_session(parsed);
+        assert!(normalized.liked_tracks.is_empty());
+        assert_eq!(normalized.repeat_mode, "one");
+
+        let dup_session = normalize_persisted_session(PersistedSession {
+            liked_tracks: vec![
+                sample_track("vid1"),
+                sample_track("  "),
+                sample_track("vid2"),
+                sample_track("vid1"),
+            ],
+            ..Default::default()
+        });
+        let ids: Vec<&str> = dup_session
+            .liked_tracks
+            .iter()
+            .map(|t| t.video_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["vid1", "vid2"]);
     }
 }

@@ -395,19 +395,22 @@ export const usePlayerStore = defineStore('player', () => {
   const relatedTracks = shallowRef<TrackItem[]>([...FALLBACK_HOME_SECTIONS[0].items.slice(1)])
   const isLoadingRelated = ref(false)
 
+  const currentTrackAlbum = computed(() => queue.value[queueIndex.value]?.album?.trim() || '')
+
   // Auth & Innertube Catalog State
   const authStatus = ref<AuthStatus>({
     is_authenticated: false,
     sapisid_preview: '',
-    account_hint: 'Guilherme',
+    account_hint: 'Não conectado',
     auth_method: '',
     has_sapisid: false,
     updated_at: 0,
   })
   const authError = ref<string | null>(null)
   const homeSections = shallowRef<HomeSection[]>([...FALLBACK_HOME_SECTIONS])
+  const exploreResults = shallowRef<TrackItem[]>([])
   const searchResults = shallowRef<TrackItem[]>([])
-  const likedTracks = shallowRef<TrackItem[]>([...FALLBACK_HOME_SECTIONS[0].items])
+  const likedTracks = shallowRef<TrackItem[]>([])
   const userPlaylists = shallowRef<PlaylistItem[]>([...FALLBACK_PLAYLISTS])
   const selectedPlaylistTracks = shallowRef<TrackItem[]>([])
   const selectedPlaylistTitle = ref<string>('')
@@ -481,7 +484,7 @@ export const usePlayerStore = defineStore('player', () => {
       }
 
       await loadHomeFeed()
-      loadLikedMusic()
+      await loadLikedMusic()
       loadUserPlaylists()
     } catch {
       // Browser preview fallback outside Tauri runtime
@@ -504,12 +507,14 @@ export const usePlayerStore = defineStore('player', () => {
     }
   }
 
+  let latestLyricsRequestId = 0
   async function fetchLyrics(forceVideoId?: string, forceTitle?: string, forceArtist?: string) {
     const targetVideoId = (forceVideoId ?? videoId.value).trim()
     const targetTitle = (forceTitle ?? currentTrackTitle.value).trim()
     const targetArtist = (forceArtist ?? currentTrackArtist.value).trim()
     if (!targetVideoId && !targetTitle) return
 
+    const requestId = ++latestLyricsRequestId
     isLoadingLyrics.value = true
     try {
       if (isTauriConnected.value) {
@@ -518,6 +523,9 @@ export const usePlayerStore = defineStore('player', () => {
           title: targetTitle || null,
           artist: targetArtist || null,
         })
+        if (requestId !== latestLyricsRequestId) return
+        if (targetVideoId && videoId.value && videoId.value !== targetVideoId) return
+
         const rawTimed = Array.isArray(raw.timedLines)
           ? raw.timedLines
           : Array.isArray(raw.timed_lines)
@@ -561,6 +569,9 @@ export const usePlayerStore = defineStore('player', () => {
               : 'Letra indisponível para esta faixa'),
         }
       } else {
+        if (requestId !== latestLyricsRequestId) return
+        if (targetVideoId && videoId.value && videoId.value !== targetVideoId) return
+
         const previewTimed = buildFallbackLyrics(targetTitle, targetArtist)
         lyrics.value = {
           videoId: targetVideoId,
@@ -572,6 +583,9 @@ export const usePlayerStore = defineStore('player', () => {
         }
       }
     } catch {
+      if (requestId !== latestLyricsRequestId) return
+      if (targetVideoId && videoId.value && videoId.value !== targetVideoId) return
+
       if (isTauriConnected.value) {
         lyrics.value = {
           videoId: targetVideoId,
@@ -593,7 +607,9 @@ export const usePlayerStore = defineStore('player', () => {
         }
       }
     } finally {
-      isLoadingLyrics.value = false
+      if (requestId === latestLyricsRequestId) {
+        isLoadingLyrics.value = false
+      }
     }
   }
 
@@ -764,24 +780,49 @@ export const usePlayerStore = defineStore('player', () => {
     return likedTrackIds.value.has(vid)
   }
 
-  function toggleLikeTrack(track?: TrackItem) {
+  async function toggleLikeTrack(track?: TrackItem) {
     const target: TrackItem = track ?? {
       video_id: videoId.value,
       title: currentTrackTitle.value,
       artist: currentTrackArtist.value,
-      album: 'YouTube Music',
+      album: currentTrackAlbum.value || 'YouTube Music',
       duration_text: formatTime(durationSecs.value),
       duration_secs: durationSecs.value,
       thumbnail_url: currentThumbnailUrl.value,
     }
+    if (!target.video_id) return
+
     if (likedTrackIds.value.has(target.video_id)) {
       likedTracks.value = likedTracks.value.filter((t) => t.video_id !== target.video_id)
     } else {
       likedTracks.value = [target, ...likedTracks.value]
     }
+
+    if (isTauriConnected.value) {
+      try {
+        const updated = await invoke<TrackItem[]>('toggle_like_track', { track: target })
+        if (Array.isArray(updated)) {
+          likedTracks.value = updated
+        }
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
+    }
   }
 
   async function addToQueue(track: TrackItem) {
+    if (isTauriConnected.value) {
+      try {
+        const updated = await invoke<TrackItem[]>('add_to_queue', { track })
+        if (Array.isArray(updated)) {
+          queue.value = updated
+          queueLen.value = updated.length
+        }
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
+      return
+    }
     if (queue.value.some((t) => t.video_id === track.video_id)) return
     queue.value = [...queue.value, track]
     queueLen.value = queue.value.length
@@ -850,6 +891,8 @@ export const usePlayerStore = defineStore('player', () => {
     const status = await invoke<AuthStatus>('logout_auth')
     authStatus.value = status
     await loadHomeFeed()
+    await loadLikedMusic()
+    await loadUserPlaylists()
   }
 
   async function loadHomeFeed() {
@@ -879,12 +922,9 @@ export const usePlayerStore = defineStore('player', () => {
     }
   }
 
-  async function searchMusic(query: string, filterOverride?: SearchFilter) {
+  async function queryTracks(query: string, filter?: SearchFilter): Promise<TrackItem[]> {
     const trimmed = query.trim()
-    if (!trimmed) return
-    if (filterOverride) {
-      searchFilter.value = filterOverride
-    }
+    if (!trimmed) return []
     if (!isTauriConnected.value) {
       const qLower = trimmed.toLowerCase()
       const all = homeSections.value.flatMap((s) => s.items)
@@ -894,15 +934,34 @@ export const usePlayerStore = defineStore('player', () => {
           t.artist.toLowerCase().includes(qLower) ||
           t.album.toLowerCase().includes(qLower)
       )
-      searchResults.value = matches.length > 0 ? matches : all
-      return
+      return matches.length > 0 ? matches : all
+    }
+    return await invoke<TrackItem[]>('search_youtube_music', {
+      query: trimmed,
+      filter: filter ?? 'all',
+    })
+  }
+
+  async function loadExploreFeed(query = 'Novos lançamentos música') {
+    isFetchingContent.value = true
+    try {
+      exploreResults.value = await queryTracks(query, 'all')
+    } catch (err) {
+      errorMessage.value = String(err)
+    } finally {
+      isFetchingContent.value = false
+    }
+  }
+
+  async function searchMusic(query: string, filterOverride?: SearchFilter) {
+    const trimmed = query.trim()
+    if (!trimmed) return
+    if (filterOverride) {
+      searchFilter.value = filterOverride
     }
     isFetchingContent.value = true
     try {
-      searchResults.value = await invoke<TrackItem[]>('search_youtube_music', {
-        query: trimmed,
-        filter: searchFilter.value,
-      })
+      searchResults.value = await queryTracks(trimmed, searchFilter.value)
       refreshRelatedTracks()
     } catch (err) {
       errorMessage.value = String(err)
@@ -916,7 +975,7 @@ export const usePlayerStore = defineStore('player', () => {
     isFetchingContent.value = true
     try {
       const items = await invoke<TrackItem[]>('get_liked_music')
-      if (items && items.length > 0) {
+      if (Array.isArray(items)) {
         likedTracks.value = items
       }
     } catch (err) {
@@ -1084,6 +1143,7 @@ export const usePlayerStore = defineStore('player', () => {
     isPlaying,
     currentTrackTitle,
     currentTrackArtist,
+    currentTrackAlbum,
     currentThumbnailUrl,
     volume,
     queueIndex,
@@ -1113,6 +1173,7 @@ export const usePlayerStore = defineStore('player', () => {
     authStatus,
     authError,
     homeSections,
+    exploreResults,
     searchResults,
     likedTracks,
     userPlaylists,
@@ -1144,6 +1205,8 @@ export const usePlayerStore = defineStore('player', () => {
     setManualCookie,
     logout,
     loadHomeFeed,
+    queryTracks,
+    loadExploreFeed,
     searchMusic,
     loadLikedMusic,
     loadUserPlaylists,

@@ -16,7 +16,7 @@ use youtube_music_rust_lib::auth::{
 };
 use youtube_music_rust_lib::innertube::{is_valid_identifier, parse_lrc_lyrics, TrackItem};
 use youtube_music_rust_lib::persistence::{
-    get_session_file_path, load_persisted_session, normalize_persisted_session,
+    get_app_data_dir, get_session_file_path, load_persisted_session, normalize_persisted_session,
     save_persisted_session, PersistedSession,
 };
 use youtube_music_rust_lib::{determine_next_video_id, PlayerState, RepeatMode};
@@ -25,6 +25,8 @@ static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct HomeIsolationGuard<'a> {
     prev_home: Option<OsString>,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    prev_xdg_data_home: Option<OsString>,
     #[cfg(windows)]
     prev_local_appdata: Option<OsString>,
     #[cfg(windows)]
@@ -41,6 +43,8 @@ impl<'a> HomeIsolationGuard<'a> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prev_home = std::env::var_os("HOME");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let prev_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
         #[cfg(windows)]
         let prev_local_appdata = std::env::var_os("LOCALAPPDATA");
         #[cfg(windows)]
@@ -59,6 +63,8 @@ impl<'a> HomeIsolationGuard<'a> {
         ));
         fs::create_dir_all(&temp_dir).expect("should create isolated temp HOME directory");
         std::env::set_var("HOME", &temp_dir);
+        #[cfg(all(unix, not(target_os = "macos")))]
+        std::env::remove_var("XDG_DATA_HOME");
         #[cfg(windows)]
         {
             std::env::set_var("LOCALAPPDATA", &temp_dir);
@@ -67,6 +73,8 @@ impl<'a> HomeIsolationGuard<'a> {
         }
         Self {
             prev_home,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            prev_xdg_data_home,
             #[cfg(windows)]
             prev_local_appdata,
             #[cfg(windows)]
@@ -88,6 +96,11 @@ impl Drop for HomeIsolationGuard<'_> {
         match &self.prev_home {
             Some(val) => std::env::set_var("HOME", val),
             None => std::env::remove_var("HOME"),
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        match &self.prev_xdg_data_home {
+            Some(val) => std::env::set_var("XDG_DATA_HOME", val),
+            None => std::env::remove_var("XDG_DATA_HOME"),
         }
         #[cfg(windows)]
         {
@@ -237,7 +250,10 @@ fn test_progressive_audio_buffer_read_seek_with_sidx_metadata() {
     assert_eq!(read_payload, payload);
 
     // Relative seek after mark_finished
-    assert_eq!(reader.seek(SeekFrom::Current(-10)).unwrap(), expected_total - 10);
+    assert_eq!(
+        reader.seek(SeekFrom::Current(-10)).unwrap(),
+        expected_total - 10
+    );
     let mut tail = [0u8; 10];
     reader.read_exact(&mut tail).unwrap();
     assert_eq!(tail, payload[54..64]);
@@ -270,6 +286,7 @@ fn test_persistence_session_disk_roundtrip_and_unix_permissions() {
             make_track("fJ9rUzIMcZQ", "Bohemian Rhapsody", 355.0),
         ],
         queue_index: 42,
+        liked_tracks: vec![make_track("MV_3Dpw-BRY", "Nightcall", 258.0)],
     };
 
     save_persisted_session(&raw_session);
@@ -285,7 +302,10 @@ fn test_persistence_session_disk_roundtrip_and_unix_permissions() {
             & 0o777;
         let file_mode = fs::metadata(&session_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "session dir must have 0700 permissions");
-        assert_eq!(file_mode, 0o600, "player_session.json must have 0600 permissions");
+        assert_eq!(
+            file_mode, 0o600,
+            "player_session.json must have 0600 permissions"
+        );
     }
 
     let loaded = load_persisted_session().expect("saved session must load from disk");
@@ -296,6 +316,8 @@ fn test_persistence_session_disk_roundtrip_and_unix_permissions() {
     assert_eq!(loaded.theme, "light");
     assert_eq!(loaded.queue.len(), 2);
     assert_eq!(loaded.queue_index, 0);
+    assert_eq!(loaded.liked_tracks.len(), 1);
+    assert_eq!(loaded.liked_tracks[0].video_id, "MV_3Dpw-BRY");
 
     // Pure normalization matches disk normalization
     assert_eq!(
@@ -306,6 +328,16 @@ fn test_persistence_session_disk_roundtrip_and_unix_permissions() {
     // Corrupted JSON on disk gracefully returns None
     fs::write(&session_path, "{ not valid json").unwrap();
     assert!(load_persisted_session().is_none());
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn test_xdg_data_home_precedence_on_linux() {
+    let guard = HomeIsolationGuard::new("xdg_precedence");
+    let custom_xdg = guard.path().join("custom_xdg_data");
+    std::env::set_var("XDG_DATA_HOME", &custom_xdg);
+    let resolved = get_app_data_dir();
+    assert_eq!(resolved, custom_xdg.join("com.ytmusic.rust"));
 }
 
 #[test]
@@ -385,8 +417,9 @@ fn test_write_and_clean_temp_netscape_cookies_sanitization_and_permissions() {
     // Inject \r, \n, and \t into cookie_header to verify strict Netscape sanitization
     let dirty_session = AuthSession {
         is_authenticated: true,
-        cookie_header: "SAPISID=tok\r\n_clean\t123456; __Secure-3PAP\tISID=val\twith\rtabs\n; EMPTY="
-            .to_string(),
+        cookie_header:
+            "SAPISID=tok\r\n_clean\t123456; __Secure-3PAP\tISID=val\twith\rtabs\n; EMPTY="
+                .to_string(),
         sapisid: "tok_clean123456".to_string(),
         auth_method: "manual".to_string(),
         updated_at: 1,
@@ -404,7 +437,10 @@ fn test_write_and_clean_temp_netscape_cookies_sanitization_and_permissions() {
         let dir_mode = fs::metadata(&cookie_dir).unwrap().permissions().mode() & 0o777;
         let file_mode = fs::metadata(&cookie_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "cookie dir must have 0700 permissions");
-        assert_eq!(file_mode, 0o600, "temp cookie file must have 0600 permissions");
+        assert_eq!(
+            file_mode, 0o600,
+            "temp cookie file must have 0600 permissions"
+        );
     }
 
     let content = fs::read_to_string(&cookie_path).unwrap();
@@ -459,7 +495,10 @@ fn test_home_isolation_guard_restores_home_even_on_panic() {
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let guard = HomeIsolationGuard::new("panic_restore");
         captured_temp_dir = Some(guard.path().clone());
-        assert_eq!(std::env::var_os("HOME"), Some(guard.path().as_os_str().to_os_string()));
+        assert_eq!(
+            std::env::var_os("HOME"),
+            Some(guard.path().as_os_str().to_os_string())
+        );
         panic!("simulated test failure");
     }));
 

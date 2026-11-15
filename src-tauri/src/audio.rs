@@ -474,6 +474,7 @@ pub struct AudioTelemetry {
     pub position_ms: AtomicU64,
     pub is_sink_empty: AtomicBool,
     pub has_active_track: AtomicBool,
+    pub last_error: Mutex<Option<String>>,
 }
 
 impl Default for AudioTelemetry {
@@ -488,6 +489,7 @@ impl AudioTelemetry {
             position_ms: AtomicU64::new(0),
             is_sink_empty: AtomicBool::new(true),
             has_active_track: AtomicBool::new(false),
+            last_error: Mutex::new(None),
         }
     }
 
@@ -560,16 +562,51 @@ impl AudioEngine {
                                         .store(false, Ordering::Relaxed);
                                     thread_telemetry
                                         .has_active_track
-                                        .store(true, Ordering::Relaxed);
+                                        .store(false, Ordering::Relaxed);
+                                    if let Ok(mut err_guard) = thread_telemetry.last_error.lock() {
+                                        *err_guard = None;
+                                    }
 
+                                    let mut init_error: Option<String> = None;
                                     if let Some((_, ref stream_handle)) = stream_opt {
-                                        if let Ok(new_sink) = Sink::try_new(stream_handle) {
-                                            new_sink.set_volume(current_volume);
-                                            if let Ok(decoder) = Decoder::new(data.reader()) {
-                                                new_sink.append(decoder);
-                                                new_sink.play();
-                                                sink_opt = Some(new_sink);
+                                        match Sink::try_new(stream_handle) {
+                                            Ok(new_sink) => {
+                                                new_sink.set_volume(current_volume);
+                                                match Decoder::new(data.reader()) {
+                                                    Ok(decoder) => {
+                                                        new_sink.append(decoder);
+                                                        new_sink.play();
+                                                        sink_opt = Some(new_sink);
+                                                        thread_telemetry
+                                                            .has_active_track
+                                                            .store(true, Ordering::Relaxed);
+                                                    }
+                                                    Err(e) => {
+                                                        init_error = Some(format!(
+                                                            "Falha ao decodificar fluxo de áudio: {e}"
+                                                        ));
+                                                    }
+                                                }
                                             }
+                                            Err(e) => {
+                                                init_error = Some(format!(
+                                                    "Falha ao abrir canal de saída de áudio: {e}"
+                                                ));
+                                            }
+                                        }
+                                    } else {
+                                        init_error = Some(
+                                            "Nenhum dispositivo de saída de áudio disponível no sistema."
+                                                .to_string(),
+                                        );
+                                    }
+
+                                    if let Some(err_msg) = init_error {
+                                        thread_telemetry
+                                            .is_sink_empty
+                                            .store(true, Ordering::Relaxed);
+                                        if let Ok(mut err_guard) = thread_telemetry.last_error.lock() {
+                                            *err_guard = Some(err_msg);
                                         }
                                     }
                                 }
@@ -685,6 +722,21 @@ impl AudioEngine {
     }
 
     pub fn send(&self, cmd: AudioCommand) {
+        match &cmd {
+            AudioCommand::LoadAndPlay { .. } => {
+                self.telemetry.position_ms.store(0, Ordering::Relaxed);
+                self.telemetry.is_sink_empty.store(false, Ordering::Relaxed);
+                self.telemetry.has_active_track.store(false, Ordering::Relaxed);
+            }
+            AudioCommand::Seek(_) => {
+                self.telemetry.is_sink_empty.store(false, Ordering::Relaxed);
+            }
+            AudioCommand::Stop => {
+                self.telemetry.is_sink_empty.store(true, Ordering::Relaxed);
+                self.telemetry.has_active_track.store(false, Ordering::Relaxed);
+            }
+            _ => {}
+        }
         if let Ok(guard) = self.sender.lock() {
             let _ = guard.send(cmd);
         }
@@ -692,6 +744,18 @@ impl AudioEngine {
 
     pub fn get_position_secs(&self) -> f64 {
         self.telemetry.position_seconds()
+    }
+
+    pub fn has_active_track(&self) -> bool {
+        self.telemetry.has_active_track.load(Ordering::Relaxed)
+    }
+
+    pub fn take_last_error(&self) -> Option<String> {
+        self.telemetry
+            .last_error
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
     }
 
     pub fn is_track_finished(&self) -> bool {

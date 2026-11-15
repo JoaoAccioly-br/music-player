@@ -296,6 +296,31 @@ pub async fn fetch_liked_music(auth: Option<&AuthSession>) -> Result<Vec<TrackIt
     Ok(curated_fallback_liked_tracks())
 }
 
+/// Sends a Like (`like/like`) or Remove Like (`like/removelike`) mutation to YouTube Music Innertube.
+pub async fn set_track_like_status(
+    video_id: &str,
+    liked: bool,
+    auth: &AuthSession,
+) -> Result<(), String> {
+    if !auth.is_authenticated || auth.sapisid.is_empty() {
+        return Err("Usuário não autenticado para sincronizar curtidas.".to_string());
+    }
+    let trimmed_id = video_id.trim();
+    if !is_valid_identifier(trimmed_id, 32) {
+        return Err("Identificador de faixa inválido.".to_string());
+    }
+
+    let endpoint = if liked { "like/like" } else { "like/removelike" };
+    let client = InnertubeClient::new()?;
+    let payload = json!({
+        "target": {
+            "videoId": trimmed_id
+        }
+    });
+    client.post_endpoint(endpoint, payload, Some(auth)).await?;
+    Ok(())
+}
+
 /// Fetches the user's saved playlists from their library (`browseId: "FEmusic_liked_playlists"`).
 pub async fn fetch_user_playlists(auth: Option<&AuthSession>) -> Result<Vec<PlaylistItem>, String> {
     let client = InnertubeClient::new()?;

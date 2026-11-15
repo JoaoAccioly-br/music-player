@@ -53,6 +53,8 @@ const youtubeInputUrl = ref('')
 const activeHomeMood = ref<string>('Tudo')
 const activeExploreCategory = ref<string>('Novos lançamentos')
 const activeLibraryFilter = ref<'playlists' | 'albums' | 'artists' | 'songs'>('playlists')
+const selectedPlaylistId = ref<string>('')
+const selectedPlaylistSectionRef = ref<HTMLElement | null>(null)
 
 const homeMoods = [
   {
@@ -154,7 +156,7 @@ const greetingText = computed(() => {
   const userName =
     rawHint && rawHint !== 'Não conectado' && !rawHint.includes('SAPISID')
       ? rawHint.split('@')[0]
-      : 'Guilherme'
+      : 'Visitante'
   return `${salutation}, ${userName}`
 })
 
@@ -165,11 +167,76 @@ const listenAgainTracks = computed<TrackItem[]>(() => {
 })
 
 const exploreTracks = computed<TrackItem[]>(() => {
-  if (player.searchResults.length > 0) {
-    return player.searchResults.slice(0, 10)
+  if (player.exploreResults.length > 0) {
+    return player.exploreResults.slice(0, 10)
   }
   const all = player.homeSections.flatMap((s) => s.items)
   return all.length > 0 ? all.slice(0, 10) : player.queue
+})
+
+const libraryAllTracks = computed<TrackItem[]>(() => {
+  const seen = new Set<string>()
+  const merged: TrackItem[] = []
+  const sources = [
+    ...player.likedTracks,
+    ...player.selectedPlaylistTracks,
+    ...player.homeSections.flatMap((s) => s.items),
+    ...player.queue,
+  ]
+  for (const track of sources) {
+    if (track.video_id && !seen.has(track.video_id)) {
+      seen.add(track.video_id)
+      merged.push(track)
+    }
+  }
+  return merged
+})
+
+const libraryAlbums = computed(() => {
+  const groups = new Map<
+    string,
+    { id: string; title: string; artist: string; thumbnail_url: string; tracks: TrackItem[] }
+  >()
+  for (const track of libraryAllTracks.value) {
+    const albumName = (track.album || '').trim()
+    if (!albumName || albumName === 'YouTube Music' || albumName === 'Single') continue
+    const existing = groups.get(albumName)
+    if (existing) {
+      existing.tracks.push(track)
+    } else {
+      groups.set(albumName, {
+        id: `album:${albumName}`,
+        title: albumName,
+        artist: track.artist,
+        thumbnail_url: track.thumbnail_url,
+        tracks: [track],
+      })
+    }
+  }
+  return Array.from(groups.values())
+})
+
+const libraryArtists = computed(() => {
+  const groups = new Map<
+    string,
+    { id: string; name: string; thumbnail_url: string; tracks: TrackItem[] }
+  >()
+  for (const track of libraryAllTracks.value) {
+    const artistName = (track.artist || '').trim()
+    if (!artistName) continue
+    const existing = groups.get(artistName)
+    if (existing) {
+      existing.tracks.push(track)
+    } else {
+      groups.set(artistName, {
+        id: `artist:${artistName}`,
+        name: artistName,
+        thumbnail_url: track.thumbnail_url,
+        tracks: [track],
+      })
+    }
+  }
+  return Array.from(groups.values())
 })
 
 const displayedSearchResults = computed<TrackItem[]>(() => {
@@ -268,12 +335,12 @@ async function selectHomeMood(mood: { label: string; query: string }) {
   if (!mood.query) {
     await player.loadHomeFeed()
   } else {
-    await player.searchMusic(mood.query)
-    if (player.searchResults.length > 0) {
+    const items = await player.queryTracks(mood.query)
+    if (items.length > 0) {
       player.homeSections = [
         {
           title: `Ouvir de novo • ${mood.label}`,
-          items: player.searchResults.slice(0, 10),
+          items: items.slice(0, 10),
         },
         ...player.homeSections.slice(1),
       ]
@@ -282,11 +349,9 @@ async function selectHomeMood(mood: { label: string; query: string }) {
 }
 
 async function playMixCard(query: string) {
-  await player.searchMusic(query)
+  const results = await player.queryTracks(query)
   const tracks =
-    player.searchResults.length > 0
-      ? player.searchResults
-      : player.homeSections.flatMap((s) => s.items)
+    results.length > 0 ? results : player.homeSections.flatMap((s) => s.items)
   if (tracks.length > 0) {
     await player.playTrackList(tracks, 0)
   }
@@ -294,7 +359,7 @@ async function playMixCard(query: string) {
 
 async function selectExploreCategory(title: string, query: string) {
   activeExploreCategory.value = title
-  await player.searchMusic(query)
+  await player.loadExploreFeed(query)
 }
 
 async function handleMoodPillSearch(label: string) {
@@ -315,8 +380,8 @@ async function switchTab(tab: 'home' | 'explore' | 'library' | 'liked') {
     await player.loadUserPlaylists()
   } else if (tab === 'liked') {
     await player.loadLikedMusic()
-  } else if (tab === 'explore' && player.searchResults.length === 0) {
-    await player.searchMusic('Novos lançamentos música')
+  } else if (tab === 'explore' && player.exploreResults.length === 0) {
+    await player.loadExploreFeed('Novos lançamentos música')
   }
 }
 
@@ -324,15 +389,36 @@ function handlePlayFromList(tracks: TrackItem[], index: number) {
   player.playTrackList(tracks, index)
 }
 
-function handleSelectPlaylist(pl: PlaylistItem) {
-  player.loadPlaylistTracks(pl)
+async function handleSelectPlaylist(pl: PlaylistItem) {
+  selectedPlaylistId.value = pl.playlist_id
+  const loadPromise = player.loadPlaylistTracks(pl)
+  await nextTick()
+  selectedPlaylistSectionRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  await loadPromise
+  await nextTick()
+  selectedPlaylistSectionRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 async function handlePlayPlaylistImmediate(pl: PlaylistItem) {
   await player.loadPlaylistTracks(pl)
   if (player.selectedPlaylistTracks.length > 0) {
-    player.playTrackList(player.selectedPlaylistTracks, 0)
+    await player.playTrackList(player.selectedPlaylistTracks, 0)
   }
+}
+
+async function handleSelectLocalLibraryCollection(id: string, title: string, tracks: TrackItem[]) {
+  selectedPlaylistId.value = id
+  player.selectedPlaylistTitle = title
+  player.selectedPlaylistTracks = tracks
+  await nextTick()
+  selectedPlaylistSectionRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+async function handleShufflePlayList(tracks: TrackItem[]) {
+  if (!tracks.length) return
+  const startIdx = Math.floor(Math.random() * tracks.length)
+  await player.playTrackList(tracks, startIdx)
+  await player.shuffleQueue()
 }
 
 function handleOpenLyricsView() {
@@ -350,8 +436,26 @@ function handlePlayCustomYoutube() {
   showCustomStreamModal.value = false
 }
 
-function handleFullscreenSeek(event: Event) {
+const isFullscreenSeeking = ref(false)
+const fullscreenSeekPreview = ref(0)
+const displayedFullscreenPos = computed(() =>
+  isFullscreenSeeking.value ? fullscreenSeekPreview.value : player.positionSecs
+)
+
+function handleFullscreenSeekStart() {
+  isFullscreenSeeking.value = true
+  fullscreenSeekPreview.value = player.positionSecs
+}
+
+function handleFullscreenSeekInput(event: Event) {
   const target = event.target as HTMLInputElement
+  isFullscreenSeeking.value = true
+  fullscreenSeekPreview.value = parseFloat(target.value)
+}
+
+function handleFullscreenSeekCommit(event: Event) {
+  const target = event.target as HTMLInputElement
+  isFullscreenSeeking.value = false
   player.seekTo(parseFloat(target.value))
 }
 
@@ -419,7 +523,7 @@ onUnmounted(() => {
                       {{ player.currentTrackTitle }}
                     </h1>
                     <p class="text-xs sm:text-sm text-[#6E6885] dark:text-[#9B94B2] mt-1">
-                      {{ player.currentTrackArtist }} • OutRun
+                      {{ player.currentTrackArtist }}{{ player.currentTrackAlbum ? ` • ${player.currentTrackAlbum}` : '' }}
                     </p>
                   </div>
 
@@ -557,7 +661,11 @@ onUnmounted(() => {
                 v-for="filter in searchFilterOptions"
                 :key="filter.id"
                 type="button"
-                @click="player.searchFilter = filter.id"
+                @click="
+                  searchQuery.trim()
+                    ? player.searchMusic(searchQuery, filter.id)
+                    : (player.searchFilter = filter.id)
+                "
                 :class="[
                   'px-4 py-1.5 rounded-full text-xs font-semibold transition-all',
                   player.searchFilter === filter.id
@@ -1007,8 +1115,11 @@ onUnmounted(() => {
               </div>
             </section>
 
-            <!-- 5-Column Library Grid -->
-            <section class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-4">
+            <!-- Playlists Grid -->
+            <section
+              v-if="activeLibraryFilter === 'playlists'"
+              class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-4"
+            >
               <!-- Card 1: Dashed "+ Nova playlist" / Tocar Stream Direto -->
               <div
                 @click="showCustomStreamModal = true"
@@ -1046,7 +1157,7 @@ onUnmounted(() => {
                 </div>
                 <h3 class="font-semibold text-xs sm:text-[13px] truncate">Músicas curtidas</h3>
                 <p class="text-[11px] text-[#6E6885] dark:text-[#9B94B2] truncate mt-0.5">
-                  Playlist automática
+                  {{ player.likedTracks.length }} músicas
                 </p>
               </div>
 
@@ -1059,7 +1170,10 @@ onUnmounted(() => {
               >
                 <div
                   :class="[
-                    'w-full aspect-square rounded-2xl mb-2.5 relative overflow-hidden bg-gradient-to-br shadow-sm group-hover:shadow-md group-hover:-translate-y-0.5 transition-all border border-[rgba(120,100,180,0.12)] dark:border-white/[0.07]',
+                    'w-full aspect-square rounded-2xl mb-2.5 relative overflow-hidden bg-gradient-to-br shadow-sm group-hover:shadow-md group-hover:-translate-y-0.5 transition-all border',
+                    selectedPlaylistId === pl.playlist_id
+                      ? 'border-[#7C5CFC] ring-2 ring-[#7C5CFC]/35'
+                      : 'border-[rgba(120,100,180,0.12)] dark:border-white/[0.07]',
                     getPastelGradient(pl.playlist_id + pl.title + pIdx),
                   ]"
                 >
@@ -1087,13 +1201,122 @@ onUnmounted(() => {
               </div>
             </section>
 
-            <!-- Selected Playlist Tracks Drawer/Section -->
-            <section v-if="player.selectedPlaylistTracks.length > 0" class="space-y-3 pt-2">
+            <!-- Albums Grid -->
+            <section
+              v-else-if="activeLibraryFilter === 'albums'"
+              class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-4"
+            >
+              <div
+                v-for="(alb, aIdx) in libraryAlbums"
+                :key="alb.id"
+                @click="handleSelectLocalLibraryCollection(alb.id, alb.title, alb.tracks)"
+                class="group cursor-pointer flex flex-col"
+              >
+                <div
+                  :class="[
+                    'w-full aspect-square rounded-2xl mb-2.5 relative overflow-hidden bg-gradient-to-br shadow-sm group-hover:shadow-md group-hover:-translate-y-0.5 transition-all border',
+                    selectedPlaylistId === alb.id
+                      ? 'border-[#7C5CFC] ring-2 ring-[#7C5CFC]/35'
+                      : 'border-[rgba(120,100,180,0.12)] dark:border-white/[0.07]',
+                    getPastelGradient(alb.id + aIdx),
+                  ]"
+                >
+                  <img
+                    v-if="alb.thumbnail_url && !player.lowRamNoImages"
+                    :src="alb.thumbnail_url"
+                    :alt="alb.title"
+                    loading="lazy"
+                    decoding="async"
+                    class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                  />
+                  <button
+                    type="button"
+                    @click.stop="handlePlayFromList(alb.tracks, 0)"
+                    :title="`Tocar álbum ${alb.title}`"
+                    class="absolute bottom-2.5 right-2.5 w-8 h-8 rounded-full bg-white/90 dark:bg-[#1E1A2D]/90 text-[#1A162B] dark:text-[#F4F2FA] flex items-center justify-center shadow-md group-hover:scale-110 transition-transform"
+                  >
+                    <Play class="w-3.5 h-3.5 fill-current ml-0.5" />
+                  </button>
+                </div>
+                <h3 class="font-semibold text-xs sm:text-[13px] truncate">{{ alb.title }}</h3>
+                <p class="text-[11px] text-[#6E6885] dark:text-[#9B94B2] truncate mt-0.5">
+                  {{ alb.artist }} • {{ alb.tracks.length }} {{ alb.tracks.length === 1 ? 'faixa' : 'faixas' }}
+                </p>
+              </div>
+            </section>
+
+            <!-- Artists Grid -->
+            <section
+              v-else-if="activeLibraryFilter === 'artists'"
+              class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-4"
+            >
+              <div
+                v-for="(art, artIdx) in libraryArtists"
+                :key="art.id"
+                @click="handleSelectLocalLibraryCollection(art.id, art.name, art.tracks)"
+                class="group cursor-pointer flex flex-col items-center text-center"
+              >
+                <div
+                  :class="[
+                    'w-full aspect-square rounded-full mb-2.5 relative overflow-hidden bg-gradient-to-br shadow-sm group-hover:shadow-md group-hover:-translate-y-0.5 transition-all border',
+                    selectedPlaylistId === art.id
+                      ? 'border-[#7C5CFC] ring-2 ring-[#7C5CFC]/35'
+                      : 'border-[rgba(120,100,180,0.12)] dark:border-white/[0.07]',
+                    getPastelGradient(art.id + artIdx),
+                  ]"
+                >
+                  <img
+                    v-if="art.thumbnail_url && !player.lowRamNoImages"
+                    :src="art.thumbnail_url"
+                    :alt="art.name"
+                    loading="lazy"
+                    decoding="async"
+                    class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                  />
+                  <button
+                    type="button"
+                    @click.stop="handlePlayFromList(art.tracks, 0)"
+                    :title="`Tocar músicas de ${art.name}`"
+                    class="absolute bottom-2.5 right-2.5 w-8 h-8 rounded-full bg-white/90 dark:bg-[#1E1A2D]/90 text-[#1A162B] dark:text-[#F4F2FA] flex items-center justify-center shadow-md group-hover:scale-110 transition-transform"
+                  >
+                    <Play class="w-3.5 h-3.5 fill-current ml-0.5" />
+                  </button>
+                </div>
+                <h3 class="font-semibold text-xs sm:text-[13px] truncate w-full">{{ art.name }}</h3>
+                <p class="text-[11px] text-[#6E6885] dark:text-[#9B94B2] truncate mt-0.5 w-full">
+                  {{ art.tracks.length }} {{ art.tracks.length === 1 ? 'faixa' : 'faixas' }}
+                </p>
+              </div>
+            </section>
+
+            <!-- Songs List -->
+            <section
+              v-else
+              class="rounded-3xl bg-white/80 dark:bg-[#1E1A2D]/80 border border-[rgba(120,100,180,0.12)] dark:border-white/[0.07] p-2 divide-y divide-[rgba(120,100,180,0.08)] dark:divide-white/[0.05]"
+            >
+              <TrackCard
+                v-for="(track, idx) in libraryAllTracks"
+                :key="track.video_id + '-lib-song-' + idx"
+                :track="track"
+                mode="row"
+                :index="idx"
+                :show-album="true"
+                @play="handlePlayFromList(libraryAllTracks, idx)"
+              />
+            </section>
+
+            <!-- Selected Playlist / Album / Artist Tracks Drawer/Section -->
+            <section
+              v-if="activeLibraryFilter !== 'songs' && (player.selectedPlaylistTracks.length > 0 || (selectedPlaylistId && player.isFetchingContent))"
+              ref="selectedPlaylistSectionRef"
+              class="space-y-3 pt-4 scroll-mt-4"
+            >
               <div class="flex items-center justify-between">
                 <h2 class="text-base font-bold">
                   Faixas de {{ player.selectedPlaylistTitle }}
                 </h2>
                 <button
+                  v-if="player.selectedPlaylistTracks.length > 0"
                   type="button"
                   @click="handlePlayFromList(player.selectedPlaylistTracks, 0)"
                   class="px-4 py-2 rounded-full bg-[#7C5CFC] hover:bg-[#6D4AFF] text-white text-xs font-semibold flex items-center gap-1.5 shadow-sm transition-colors"
@@ -1104,6 +1327,15 @@ onUnmounted(() => {
               </div>
 
               <div
+                v-if="player.isFetchingContent && selectedPlaylistId"
+                class="py-10 flex items-center justify-center gap-2.5 text-[#6E6885] dark:text-[#9B94B2]"
+              >
+                <Loader2 class="w-5 h-5 animate-spin text-[#7C5CFC]" />
+                <span class="text-xs">Carregando faixas de {{ player.selectedPlaylistTitle }}...</span>
+              </div>
+
+              <div
+                v-else
                 class="rounded-3xl bg-white/80 dark:bg-[#1E1A2D]/80 border border-[rgba(120,100,180,0.12)] dark:border-white/[0.07] p-2 divide-y divide-[rgba(120,100,180,0.08)] dark:divide-white/[0.05]"
               >
                 <TrackCard
@@ -1150,12 +1382,7 @@ onUnmounted(() => {
 
                   <button
                     type="button"
-                    @click="
-                      () => {
-                        handlePlayFromList(player.likedTracks, 0)
-                        player.shuffleQueue()
-                      }
-                    "
+                    @click="handleShufflePlayList(player.likedTracks)"
                     class="px-5 py-2.5 rounded-full bg-white/90 dark:bg-[#1E1A2D]/90 hover:bg-white dark:hover:bg-[#28223B] text-[#1A162B] dark:text-[#F4F2FA] border border-[rgba(120,100,180,0.14)] dark:border-white/10 text-xs font-semibold transition-colors"
                   >
                     Aleatório
@@ -1181,6 +1408,12 @@ onUnmounted(() => {
             <section
               class="rounded-3xl bg-white/80 dark:bg-[#1E1A2D]/80 border border-[rgba(120,100,180,0.12)] dark:border-white/[0.07] p-2 divide-y divide-[rgba(120,100,180,0.08)] dark:divide-white/[0.05]"
             >
+              <div
+                v-if="player.likedTracks.length === 0"
+                class="py-12 px-6 text-center text-xs text-[#6E6885] dark:text-[#9B94B2]"
+              >
+                Nenhuma música curtida ainda. Clique no ícone de coração em qualquer faixa para salvá-la aqui.
+              </div>
               <TrackCard
                 v-for="(track, idx) in player.likedTracks"
                 :key="track.video_id + '-liked-' + idx"
@@ -1281,7 +1514,7 @@ onUnmounted(() => {
                 {{ player.currentTrackTitle }}
               </h2>
               <p class="text-xs text-[#6E6885] dark:text-[#9B94B2] truncate mt-0.5">
-                {{ player.currentTrackArtist }} • OutRun
+                {{ player.currentTrackArtist }}{{ player.currentTrackAlbum ? ` • ${player.currentTrackAlbum}` : '' }}
               </p>
             </div>
 
@@ -1311,12 +1544,15 @@ onUnmounted(() => {
               :min="0"
               :max="player.durationSecs || 1"
               step="0.5"
-              :value="player.positionSecs"
-              @input="handleFullscreenSeek"
+              :value="displayedFullscreenPos"
+              @pointerdown="handleFullscreenSeekStart"
+              @touchstart="handleFullscreenSeekStart"
+              @input="handleFullscreenSeekInput"
+              @change="handleFullscreenSeekCommit"
               class="w-full h-1.5 bg-[#DFD9F0] dark:bg-[#2B2540] rounded-full appearance-none cursor-pointer accent-[#7C5CFC]"
             />
             <div class="flex items-center justify-between text-[11px] text-[#6E6885] dark:text-[#9B94B2] tabular-nums">
-              <span>{{ formatTime(player.positionSecs) }}</span>
+              <span>{{ formatTime(displayedFullscreenPos) }}</span>
               <span>{{ formatTime(player.durationSecs) }}</span>
             </div>
           </div>
@@ -1479,6 +1715,6 @@ onUnmounted(() => {
     <AuthModal :open="showAuthModal" @close="showAuthModal = false" />
 
     <!-- Bottom Floating Dark Pill Player ("Player do C") -->
-    <PlayerBar @open-lyrics-view="handleOpenLyricsView" />
+    <PlayerBar :lyrics-open="showLyricsMainView" @open-lyrics-view="handleOpenLyricsView" />
   </div>
 </template>
