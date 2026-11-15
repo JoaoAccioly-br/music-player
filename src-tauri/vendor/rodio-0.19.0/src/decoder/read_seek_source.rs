@@ -9,12 +9,15 @@ pub struct ReadSeekSource<T: Read + Seek + Send + Sync> {
 
 impl<T: Read + Seek + Send + Sync> ReadSeekSource<T> {
     /// Instantiates a new `ReadSeekSource<T>` by taking ownership and wrapping the provided
-    /// `Read + Seek`er, computing `byte_len` immediately so Symphonia's `isomp4` (M4A/MP4)
-    /// demuxer can locate top-level atoms (`ftyp`, `moov`, `mdat`) and seek accurately.
+    /// `Read + Seek`er, computing `byte_len` immediately when known so Symphonia's `isomp4`
+    /// (M4A/MP4) demuxer can locate top-level atoms (`ftyp`, `moov`, `mdat`) and seek accurately.
     pub fn new(mut inner: T) -> Self {
         let byte_len = if let Ok(current_pos) = inner.stream_position() {
             let end_pos = inner.seek(SeekFrom::End(0)).ok();
             let _ = inner.seek(SeekFrom::Start(current_pos));
+            // When streaming progressively without a known total length, `ProgressiveReader`
+            // returns `u64::MAX / 4` for `SeekFrom::End(0)`. Filter that out so `byte_len()`
+            // returns `None` and Symphonia never seeks to a fake EOF offset!
             end_pos
         } else {
             None

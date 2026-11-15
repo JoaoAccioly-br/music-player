@@ -2,32 +2,78 @@
 @tailwind components;
 @tailwind utilities;
 
+:root,
+html[data-theme='light'] {
+  --bg-primary: #f7f6fa;
+  --bg-secondary: #faf9fc;
+  --bg-surface: #ffffff;
+  --bg-surface-muted: #f2eff9;
+  --bg-pill: #ede9f5;
+  --text-primary: #1a162b;
+  --text-secondary: #6e6885;
+  --text-muted: #9b94b2;
+  --border-subtle: rgba(120, 100, 180, 0.12);
+  --accent-primary: #7c5cfc;
+  --accent-hover: #6d4aff;
+  --scrollbar-track: #f2eff9;
+  --scrollbar-thumb: #d5cde8;
+}
+
+html.dark,
+html[data-theme='dark'] {
+  --bg-primary: #12101b;
+  --bg-secondary: #161321;
+  --bg-surface: #1e1a2d;
+  --bg-surface-muted: #252038;
+  --bg-pill: #1e1a2d;
+  --text-primary: #f4f2fa;
+  --text-secondary: #9b94b2;
+  --text-muted: #6e6885;
+  --border-subtle: rgba(255, 255, 255, 0.07);
+  --accent-primary: #8b6eff;
+  --accent-hover: #9d84ff;
+  --scrollbar-track: #12101b;
+  --scrollbar-thumb: #2e2844;
+}
+
 @layer base {
   html,
   body {
-    background-color: #030303;
-    color: #ffffff;
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
     user-select: none;
     -webkit-user-select: none;
-    font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    font-family:
+      Inter,
+      -apple-system,
+      BlinkMacSystemFont,
+      'Segoe UI',
+      Roboto,
+      Oxygen,
+      Ubuntu,
+      Cantarell,
+      sans-serif;
+    transition:
+      background-color 0.25s ease,
+      color 0.25s ease;
   }
 }
 
-/* Custom thin dark scrollbars */
+/* Custom thin scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #030303;
+  background: var(--scrollbar-track);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #272727;
+  background: var(--scrollbar-thumb);
   border-radius: 9999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #3f3f3f;
+  background: var(--accent-primary);
 }

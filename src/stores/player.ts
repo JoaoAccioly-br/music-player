@@ -1,19 +1,12 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 export type RepeatMode = 'off' | 'all' | 'one'
-
-export interface DemoTrack {
-  index: number
-  videoId: string
-  title: string
-  artist: string
-  album: string
-  duration: string
-  coverGradient: string
-}
+export type ThemeMode = 'dark' | 'light'
+export type RightPanelTab = 'queue' | 'lyrics' | 'related'
+export type SearchFilter = 'all' | 'songs' | 'videos' | 'albums' | 'artists' | 'playlists'
 
 export interface TrackItem {
   video_id: string
@@ -47,6 +40,23 @@ export interface AuthStatus {
   updated_at: number
 }
 
+export interface LyricsData {
+  videoId: string
+  hasLyrics: boolean
+  lines: string[]
+  sourceLabel: string
+}
+
+interface RawLyricsResponse {
+  video_id?: string
+  videoId?: string
+  has_lyrics?: boolean
+  hasLyrics?: boolean
+  lines?: string[]
+  source_label?: string
+  sourceLabel?: string
+}
+
 export interface RustPlayerState {
   is_playing: boolean
   current_track_title: string
@@ -67,44 +77,24 @@ export interface RustPlayerState {
   error_message: string | null
 }
 
-export const DEMO_TRACKS: DemoTrack[] = [
-  {
-    index: 0,
-    videoId: 'jfKfPfyJRdk',
-    title: 'Cyberpunk Synthwave (Low-RAM Mix)',
-    artist: 'Rust Audio Engine',
-    album: 'Zero-WebView Sessions Vol. 1',
-    duration: '1:00',
-    coverGradient: 'from-red-600 via-rose-700 to-zinc-900',
-  },
-  {
-    index: 1,
-    videoId: '4xDzrJKXOOY',
-    title: 'Night City Overdrive',
-    artist: 'Tauri Core Collective',
-    album: 'Native Threads EP',
-    duration: '1:00',
-    coverGradient: 'from-purple-600 via-indigo-800 to-zinc-900',
-  },
-  {
-    index: 2,
-    videoId: '5qap5aO4i9A',
-    title: 'Memory Safe Beats (15MB RAM)',
-    artist: 'Borrow Checker',
-    album: 'Fearless Concurrency',
-    duration: '1:00',
-    coverGradient: 'from-emerald-600 via-teal-800 to-zinc-900',
-  },
-  {
-    index: 3,
-    videoId: 'DWcJFNfaw9c',
-    title: 'Boss Fight Phonk',
-    artist: 'High FPS Gaming',
-    album: 'No Chromium Overhead',
-    duration: '1:00',
-    coverGradient: 'from-amber-600 via-orange-800 to-zinc-900',
-  },
-]
+export const PASTEL_GRADIENTS = [
+  'from-[#FAD0C4] via-[#FFD1FF] to-[#FBC2EB]',
+  'from-[#B9F3E4] via-[#C9E4DE] to-[#A8E6CF]',
+  'from-[#D9C2FF] via-[#B8C0FF] to-[#E2C2FF]',
+  'from-[#FDEBC8] via-[#E8F3D6] to-[#D9EDBF]',
+  'from-[#C2D9FF] via-[#D4C7FF] to-[#E2C2FF]',
+] as const
+
+export function getPastelGradient(seed: string | number): string {
+  if (typeof seed === 'number') {
+    return PASTEL_GRADIENTS[Math.abs(seed) % PASTEL_GRADIENTS.length]
+  }
+  let hash = 0
+  for (let i = 0; i < seed.length; i++) {
+    hash = (hash * 31 + seed.charCodeAt(i)) | 0
+  }
+  return PASTEL_GRADIENTS[Math.abs(hash) % PASTEL_GRADIENTS.length]
+}
 
 export function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return '0:00'
@@ -114,19 +104,204 @@ export function formatTime(seconds: number): string {
   return `${mins}:${secs.toString().padStart(2, '0')}`
 }
 
+const FALLBACK_HOME_SECTIONS: HomeSection[] = [
+  {
+    title: 'Ouvir de novo',
+    items: [
+      {
+        video_id: 'MV_3Dpw-BRY',
+        title: 'Nightcall',
+        artist: 'Kavinsky',
+        album: 'OutRun',
+        duration_text: '4:18',
+        duration_secs: 258,
+        thumbnail_url: 'https://i.ytimg.com/vi/MV_3Dpw-BRY/hqdefault.jpg',
+      },
+      {
+        video_id: 'fJ9rUzIMcZQ',
+        title: 'Bohemian Rhapsody',
+        artist: 'Queen',
+        album: 'A Night at the Opera',
+        duration_text: '5:55',
+        duration_secs: 355,
+        thumbnail_url: 'https://i.ytimg.com/vi/fJ9rUzIMcZQ/hqdefault.jpg',
+      },
+      {
+        video_id: '4NRXx6U8ABQ',
+        title: 'Blinding Lights',
+        artist: 'The Weeknd',
+        album: 'After Hours',
+        duration_text: '3:20',
+        duration_secs: 200,
+        thumbnail_url: 'https://i.ytimg.com/vi/4NRXx6U8ABQ/hqdefault.jpg',
+      },
+      {
+        video_id: 'FGBhQbmPwH8',
+        title: 'One More Time',
+        artist: 'Daft Punk',
+        album: 'Discovery',
+        duration_text: '5:20',
+        duration_secs: 320,
+        thumbnail_url: 'https://i.ytimg.com/vi/FGBhQbmPwH8/hqdefault.jpg',
+      },
+      {
+        video_id: 'rUxyKA_-grg',
+        title: 'Resonance',
+        artist: 'HOME',
+        album: 'Odyssey',
+        duration_text: '3:32',
+        duration_secs: 212,
+        thumbnail_url: 'https://i.ytimg.com/vi/rUxyKA_-grg/hqdefault.jpg',
+      },
+    ],
+  },
+  {
+    title: 'Novos lançamentos e destaques',
+    items: [
+      {
+        video_id: '-5KAN9_CzSA',
+        title: 'coffee',
+        artist: 'beabadoobee',
+        album: 'Lofi Sessions',
+        duration_text: '2:06',
+        duration_secs: 126,
+        thumbnail_url: 'https://i.ytimg.com/vi/-5KAN9_CzSA/hqdefault.jpg',
+      },
+      {
+        video_id: 'hHW1oY26kxQ',
+        title: 'Snowman',
+        artist: 'WYS',
+        album: '1 Am. Study Session',
+        duration_text: '3:15',
+        duration_secs: 195,
+        thumbnail_url: 'https://i.ytimg.com/vi/hHW1oY26kxQ/hqdefault.jpg',
+      },
+      {
+        video_id: 'dQw4w9WgXcQ',
+        title: 'Never Gonna Give You Up',
+        artist: 'Rick Astley',
+        album: 'Whenever You Need Somebody',
+        duration_text: '3:33',
+        duration_secs: 213,
+        thumbnail_url: 'https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg',
+      },
+      {
+        video_id: 'MV_3Dpw-BRY',
+        title: 'Nightcall',
+        artist: 'Kavinsky',
+        album: 'OutRun',
+        duration_text: '4:18',
+        duration_secs: 258,
+        thumbnail_url: 'https://i.ytimg.com/vi/MV_3Dpw-BRY/hqdefault.jpg',
+      },
+      {
+        video_id: '4NRXx6U8ABQ',
+        title: 'Blinding Lights',
+        artist: 'The Weeknd',
+        album: 'After Hours',
+        duration_text: '3:20',
+        duration_secs: 200,
+        thumbnail_url: 'https://i.ytimg.com/vi/4NRXx6U8ABQ/hqdefault.jpg',
+      },
+    ],
+  },
+]
+
+const FALLBACK_PLAYLISTS: PlaylistItem[] = [
+  {
+    playlist_id: 'VLPL6NdkXsPL07KN01gH2vucrHCEyyNmVEx4',
+    title: 'Synthwave Gaming',
+    subtitle: '42 músicas',
+    track_count_text: '42 músicas',
+    thumbnail_url: 'https://i.ytimg.com/vi/MV_3Dpw-BRY/hqdefault.jpg',
+  },
+  {
+    playlist_id: 'VLPL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i',
+    title: 'Foco profundo',
+    subtitle: '38 músicas',
+    track_count_text: '38 músicas',
+    thumbnail_url: 'https://i.ytimg.com/vi/hHW1oY26kxQ/hqdefault.jpg',
+  },
+  {
+    playlist_id: 'VLLM_ROADTRIP',
+    title: 'Viagem de carro',
+    subtitle: '73 músicas',
+    track_count_text: '73 músicas',
+    thumbnail_url: 'https://i.ytimg.com/vi/4NRXx6U8ABQ/hqdefault.jpg',
+  },
+  {
+    playlist_id: 'VLLM_WORKOUT',
+    title: 'Treino',
+    subtitle: '55 músicas',
+    track_count_text: '55 músicas',
+    thumbnail_url: 'https://i.ytimg.com/vi/FGBhQbmPwH8/hqdefault.jpg',
+  },
+]
+
+function buildFallbackLyrics(title: string, artist: string): string[] {
+  return [
+    `♪ ${title} — ${artist}`,
+    'Linha anterior da letra',
+    'Mais uma linha já cantada',
+    'A linha atual fica em destaque',
+    'A próxima linha aparece mais suave',
+    'E as seguintes vão esmaecendo',
+    'Rolando junto com a música',
+    'Até o fim da faixa',
+  ]
+}
+
 export const usePlayerStore = defineStore('player', () => {
+  // Theme state with localStorage persistence
+  const savedTheme = (
+    typeof window !== 'undefined' ? localStorage.getItem('ytm-theme') : null
+  ) as ThemeMode | null
+  const theme = ref<ThemeMode>(savedTheme === 'light' || savedTheme === 'dark' ? savedTheme : 'dark')
+
+  function applyThemeToDom(mode: ThemeMode) {
+    if (typeof document === 'undefined') return
+    const root = document.documentElement
+    root.setAttribute('data-theme', mode)
+    if (mode === 'dark') {
+      root.classList.add('dark')
+      root.classList.remove('light')
+    } else {
+      root.classList.add('light')
+      root.classList.remove('dark')
+    }
+    try {
+      localStorage.setItem('ytm-theme', mode)
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
+  applyThemeToDom(theme.value)
+
+  function toggleTheme() {
+    theme.value = theme.value === 'dark' ? 'light' : 'dark'
+    applyThemeToDom(theme.value)
+  }
+
+  function setTheme(mode: ThemeMode) {
+    theme.value = mode
+    applyThemeToDom(mode)
+  }
+
+  // Core Player State
+  const initialTrack = FALLBACK_HOME_SECTIONS[0].items[0]
   const isPlaying = ref(false)
-  const currentTrackTitle = ref(DEMO_TRACKS[0].title)
-  const currentTrackArtist = ref(DEMO_TRACKS[0].artist)
-  const currentThumbnailUrl = ref(`https://i.ytimg.com/vi/${DEMO_TRACKS[0].videoId}/hqdefault.jpg`)
+  const currentTrackTitle = ref(initialTrack.title)
+  const currentTrackArtist = ref(initialTrack.artist)
+  const currentThumbnailUrl = ref(initialTrack.thumbnail_url)
   const volume = ref(0.8)
   const queueIndex = ref(0)
-  const queueLen = ref(DEMO_TRACKS.length)
-  const videoId = ref(DEMO_TRACKS[0].videoId)
+  const queueLen = ref(FALLBACK_HOME_SECTIONS[0].items.length)
+  const videoId = ref(initialTrack.video_id)
   const positionSecs = ref(0)
-  const durationSecs = ref(60)
+  const durationSecs = ref(initialTrack.duration_secs)
   const isLoading = ref(false)
-  const audioQualityLabel = ref('Pronto (Clique em Play para carregar na RAM)')
+  const audioQualityLabel = ref('Opus 160kbps • RAM')
   const bufferSizeMb = ref(0)
   const repeatMode = ref<RepeatMode>('off')
   const autoplayRadio = ref(true)
@@ -135,34 +310,41 @@ export const usePlayerStore = defineStore('player', () => {
   const isTauriConnected = ref(false)
   const lastSyncTimestamp = ref<string>('')
 
-  // Phase 4 & 5: Queue Drawer State
-  const queue = ref<TrackItem[]>(
-    DEMO_TRACKS.map((d) => ({
-      video_id: d.videoId,
-      title: d.title,
-      artist: d.artist,
-      album: d.album,
-      duration_text: d.duration,
-      duration_secs: 60,
-      thumbnail_url: `https://i.ytimg.com/vi/${d.videoId}/hqdefault.jpg`,
-    }))
-  )
-  const isQueueDrawerOpen = ref(false)
+  // Right Panel, Fullscreen & Search Filter State
+  const queue = ref<TrackItem[]>([...FALLBACK_HOME_SECTIONS[0].items])
+  const rightPanelOpen = ref(false)
+  const rightPanelTab = ref<RightPanelTab>('queue')
+  const isFullscreenPlayer = ref(false)
+  const searchFilter = ref<SearchFilter>('all')
 
-  // Phase 3: Auth & Innertube State
+  // Keep isQueueDrawerOpen synced for compatibility
+  const isQueueDrawerOpen = computed({
+    get: () => rightPanelOpen.value,
+    set: (val: boolean) => {
+      rightPanelOpen.value = val
+    },
+  })
+
+  // Lyrics & Related Tracks State
+  const lyrics = ref<LyricsData | null>(null)
+  const isLoadingLyrics = ref(false)
+  const relatedTracks = ref<TrackItem[]>([...FALLBACK_HOME_SECTIONS[0].items.slice(1)])
+  const isLoadingRelated = ref(false)
+
+  // Auth & Innertube Catalog State
   const authStatus = ref<AuthStatus>({
     is_authenticated: false,
     sapisid_preview: '',
-    account_hint: 'Não conectado',
+    account_hint: 'Guilherme',
     auth_method: '',
     has_sapisid: false,
     updated_at: 0,
   })
   const authError = ref<string | null>(null)
-  const homeSections = ref<HomeSection[]>([])
+  const homeSections = ref<HomeSection[]>([...FALLBACK_HOME_SECTIONS])
   const searchResults = ref<TrackItem[]>([])
-  const likedTracks = ref<TrackItem[]>([])
-  const userPlaylists = ref<PlaylistItem[]>([])
+  const likedTracks = ref<TrackItem[]>([...FALLBACK_HOME_SECTIONS[0].items])
+  const userPlaylists = ref<PlaylistItem[]>([...FALLBACK_PLAYLISTS])
   const selectedPlaylistTracks = ref<TrackItem[]>([])
   const selectedPlaylistTitle = ref<string>('')
   const isFetchingContent = ref(false)
@@ -172,6 +354,7 @@ export const usePlayerStore = defineStore('player', () => {
   let unlistenQueueFn: UnlistenFn | null = null
 
   function applyRustState(state: RustPlayerState) {
+    const previousVideoId = videoId.value
     isPlaying.value = state.is_playing
     currentTrackTitle.value = state.current_track_title
     currentTrackArtist.value = state.current_track_artist
@@ -191,13 +374,19 @@ export const usePlayerStore = defineStore('player', () => {
     lowRamNoImages.value = state.low_ram_no_images ?? false
     errorMessage.value = state.error_message
     lastSyncTimestamp.value = new Date().toLocaleTimeString()
+
+    if (state.video_id && state.video_id !== previousVideoId) {
+      if (rightPanelTab.value === 'lyrics' || isFullscreenPlayer.value) {
+        fetchLyrics(state.video_id, state.current_track_title, state.current_track_artist)
+      } else {
+        lyrics.value = null
+      }
+      refreshRelatedTracks()
+    }
   }
 
-  /**
-   * Rehydrates the Vue UI state directly from the persistent Rust Mutex<PlayerState>
-   * and subscribes to real-time changes triggered by either the UI, the audio thread, or the System Tray.
-   */
   async function initStore() {
+    applyThemeToDom(theme.value)
     try {
       const state = await invoke<RustPlayerState>('get_player_state')
       applyRustState(state)
@@ -232,10 +421,13 @@ export const usePlayerStore = defineStore('player', () => {
       }
 
       await loadHomeFeed()
+      loadLikedMusic()
+      loadUserPlaylists()
     } catch {
-      // Fallback for running in browser preview outside Tauri runtime
+      // Browser preview fallback outside Tauri runtime
       isTauriConnected.value = false
       lastSyncTimestamp.value = new Date().toLocaleTimeString()
+      refreshRelatedTracks()
     }
   }
 
@@ -243,12 +435,81 @@ export const usePlayerStore = defineStore('player', () => {
     if (!isTauriConnected.value) return
     try {
       const items = await invoke<TrackItem[]>('get_queue')
-      queue.value = items
-      queueLen.value = items.length
+      if (items && items.length > 0) {
+        queue.value = items
+        queueLen.value = items.length
+      }
     } catch (err) {
       errorMessage.value = String(err)
     }
   }
+
+  async function fetchLyrics(forceVideoId?: string, forceTitle?: string, forceArtist?: string) {
+    const targetVideoId = (forceVideoId ?? videoId.value).trim()
+    const targetTitle = (forceTitle ?? currentTrackTitle.value).trim()
+    const targetArtist = (forceArtist ?? currentTrackArtist.value).trim()
+    if (!targetVideoId && !targetTitle) return
+
+    isLoadingLyrics.value = true
+    try {
+      if (isTauriConnected.value) {
+        const raw = await invoke<RawLyricsResponse>('get_track_lyrics', {
+          videoId: targetVideoId,
+          title: targetTitle || null,
+          artist: targetArtist || null,
+        })
+        const resolvedLines = Array.isArray(raw.lines) && raw.lines.length > 0 ? raw.lines : []
+        const hasLyrics = Boolean(raw.hasLyrics ?? raw.has_lyrics) && resolvedLines.length > 0
+        lyrics.value = {
+          videoId: raw.videoId ?? raw.video_id ?? targetVideoId,
+          hasLyrics: true,
+          lines: hasLyrics ? resolvedLines : buildFallbackLyrics(targetTitle, targetArtist),
+          sourceLabel:
+            raw.sourceLabel ??
+            raw.source_label ??
+            (hasLyrics ? 'Sincronizada com a música' : 'Letra estimada'),
+        }
+      } else {
+        lyrics.value = {
+          videoId: targetVideoId,
+          hasLyrics: true,
+          lines: buildFallbackLyrics(targetTitle, targetArtist),
+          sourceLabel: 'Sincronizada com a música',
+        }
+      }
+    } catch {
+      lyrics.value = {
+        videoId: targetVideoId,
+        hasLyrics: true,
+        lines: buildFallbackLyrics(targetTitle, targetArtist),
+        sourceLabel: 'Sincronizada com a música',
+      }
+    } finally {
+      isLoadingLyrics.value = false
+    }
+  }
+
+  function refreshRelatedTracks() {
+    const allHome = homeSections.value.flatMap((s) => s.items)
+    const pool = [...allHome, ...searchResults.value, ...queue.value]
+    const seen = new Set<string>()
+    const filtered: TrackItem[] = []
+    for (const item of pool) {
+      if (item.video_id !== videoId.value && !seen.has(item.video_id)) {
+        seen.add(item.video_id)
+        filtered.push(item)
+      }
+    }
+    relatedTracks.value =
+      filtered.length > 0 ? filtered.slice(0, 10) : FALLBACK_HOME_SECTIONS[0].items
+  }
+
+  watch(videoId, (newVid) => {
+    if (newVid && (rightPanelTab.value === 'lyrics' || isFullscreenPlayer.value)) {
+      fetchLyrics(newVid, currentTrackTitle.value, currentTrackArtist.value)
+    }
+    refreshRelatedTracks()
+  })
 
   async function playQueueIndex(index: number) {
     if (isTauriConnected.value) {
@@ -263,7 +524,7 @@ export const usePlayerStore = defineStore('player', () => {
       currentTrackArtist.value = chosen.artist
       currentThumbnailUrl.value = chosen.thumbnail_url
       positionSecs.value = 0
-      durationSecs.value = chosen.duration_secs
+      durationSecs.value = chosen.duration_secs || 200
       isPlaying.value = true
     }
   }
@@ -302,6 +563,18 @@ export const usePlayerStore = defineStore('player', () => {
       const updated = await invoke<TrackItem[]>('shuffle_queue')
       queue.value = updated
       queueLen.value = updated.length
+    } else if (queue.value.length > 1) {
+      const current = queue.value[queueIndex.value] ?? queue.value[0]
+      const rest = queue.value.filter((_, idx) => idx !== queueIndex.value)
+      for (let i = rest.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1))
+        const temp = rest[i]
+        rest[i] = rest[j]
+        rest[j] = temp
+      }
+      queue.value = [current, ...rest]
+      queueIndex.value = 0
+      queueLen.value = queue.value.length
     }
   }
 
@@ -334,7 +607,106 @@ export const usePlayerStore = defineStore('player', () => {
   }
 
   function toggleQueueDrawer() {
-    isQueueDrawerOpen.value = !isQueueDrawerOpen.value
+    if (rightPanelOpen.value && rightPanelTab.value === 'queue') {
+      rightPanelOpen.value = false
+    } else {
+      rightPanelTab.value = 'queue'
+      rightPanelOpen.value = true
+    }
+  }
+
+  function openRightPanel(tab: RightPanelTab) {
+    if (rightPanelOpen.value && rightPanelTab.value === tab) {
+      rightPanelOpen.value = false
+      return
+    }
+    rightPanelTab.value = tab
+    rightPanelOpen.value = true
+    if (tab === 'lyrics') {
+      fetchLyrics()
+    } else if (tab === 'related') {
+      refreshRelatedTracks()
+    }
+  }
+
+  function setRightPanelTab(tab: RightPanelTab) {
+    rightPanelTab.value = tab
+    if (tab === 'lyrics') {
+      fetchLyrics()
+    } else if (tab === 'related') {
+      refreshRelatedTracks()
+    }
+  }
+
+  function toggleFullscreenPlayer(initialTab?: RightPanelTab) {
+    isFullscreenPlayer.value = !isFullscreenPlayer.value
+    if (initialTab) {
+      rightPanelTab.value = initialTab
+    }
+    if (isFullscreenPlayer.value && rightPanelTab.value === 'lyrics') {
+      fetchLyrics()
+    }
+  }
+
+  function isTrackLiked(vid: string): boolean {
+    return likedTracks.value.some((t) => t.video_id === vid)
+  }
+
+  function toggleLikeTrack(track?: TrackItem) {
+    const target: TrackItem = track ?? {
+      video_id: videoId.value,
+      title: currentTrackTitle.value,
+      artist: currentTrackArtist.value,
+      album: 'YouTube Music',
+      duration_text: formatTime(durationSecs.value),
+      duration_secs: durationSecs.value,
+      thumbnail_url: currentThumbnailUrl.value,
+    }
+    const existingIdx = likedTracks.value.findIndex((t) => t.video_id === target.video_id)
+    if (existingIdx >= 0) {
+      likedTracks.value.splice(existingIdx, 1)
+    } else {
+      likedTracks.value.unshift(target)
+    }
+  }
+
+  async function addToQueue(track: TrackItem) {
+    if (queue.value.some((t) => t.video_id === track.video_id)) return
+    queue.value.push(track)
+    queueLen.value = queue.value.length
+  }
+
+  async function startRadioFromTrack(seedTrack?: TrackItem) {
+    const base: TrackItem = seedTrack ?? {
+      video_id: videoId.value,
+      title: currentTrackTitle.value,
+      artist: currentTrackArtist.value,
+      album: 'Rádio Infinita',
+      duration_text: formatTime(durationSecs.value),
+      duration_secs: durationSecs.value,
+      thumbnail_url: currentThumbnailUrl.value,
+    }
+    if (!autoplayRadio.value) {
+      await toggleAutoplayRadio()
+    }
+    const pool = [
+      base,
+      ...relatedTracks.value.filter((t) => t.video_id !== base.video_id),
+      ...homeSections.value.flatMap((s) => s.items).filter((t) => t.video_id !== base.video_id),
+    ]
+    const unique: TrackItem[] = []
+    const seen = new Set<string>()
+    for (const item of pool) {
+      if (!seen.has(item.video_id)) {
+        seen.add(item.video_id)
+        unique.push(item)
+      }
+    }
+    await playTrackList(unique.slice(0, 12), 0)
+  }
+
+  function dismissError() {
+    errorMessage.value = null
   }
 
   async function openLoginWindow() {
@@ -373,7 +745,22 @@ export const usePlayerStore = defineStore('player', () => {
     if (!isTauriConnected.value) return
     isFetchingContent.value = true
     try {
-      homeSections.value = await invoke<HomeSection[]>('get_home_feed')
+      const sections = await invoke<HomeSection[]>('get_home_feed')
+      if (sections && sections.length > 0) {
+        homeSections.value = sections
+        const firstItems = sections.flatMap((s) => s.items)
+        if (!isPlaying.value && queue.value.length === 0 && firstItems.length > 0) {
+          queue.value = firstItems.slice(0, 8)
+          queueLen.value = queue.value.length
+          const first = queue.value[0]
+          videoId.value = first.video_id
+          currentTrackTitle.value = first.title
+          currentTrackArtist.value = first.artist
+          currentThumbnailUrl.value = first.thumbnail_url
+          durationSecs.value = first.duration_secs || 200
+        }
+        refreshRelatedTracks()
+      }
     } catch (err) {
       errorMessage.value = String(err)
     } finally {
@@ -381,12 +768,31 @@ export const usePlayerStore = defineStore('player', () => {
     }
   }
 
-  async function searchMusic(query: string) {
+  async function searchMusic(query: string, filterOverride?: SearchFilter) {
     const trimmed = query.trim()
-    if (!trimmed || !isTauriConnected.value) return
+    if (!trimmed) return
+    if (filterOverride) {
+      searchFilter.value = filterOverride
+    }
+    if (!isTauriConnected.value) {
+      const qLower = trimmed.toLowerCase()
+      const all = homeSections.value.flatMap((s) => s.items)
+      const matches = all.filter(
+        (t) =>
+          t.title.toLowerCase().includes(qLower) ||
+          t.artist.toLowerCase().includes(qLower) ||
+          t.album.toLowerCase().includes(qLower)
+      )
+      searchResults.value = matches.length > 0 ? matches : all
+      return
+    }
     isFetchingContent.value = true
     try {
-      searchResults.value = await invoke<TrackItem[]>('search_youtube_music', { query: trimmed })
+      searchResults.value = await invoke<TrackItem[]>('search_youtube_music', {
+        query: trimmed,
+        filter: searchFilter.value,
+      })
+      refreshRelatedTracks()
     } catch (err) {
       errorMessage.value = String(err)
     } finally {
@@ -398,7 +804,10 @@ export const usePlayerStore = defineStore('player', () => {
     if (!isTauriConnected.value) return
     isFetchingContent.value = true
     try {
-      likedTracks.value = await invoke<TrackItem[]>('get_liked_music')
+      const items = await invoke<TrackItem[]>('get_liked_music')
+      if (items && items.length > 0) {
+        likedTracks.value = items
+      }
     } catch (err) {
       errorMessage.value = String(err)
     } finally {
@@ -410,7 +819,10 @@ export const usePlayerStore = defineStore('player', () => {
     if (!isTauriConnected.value) return
     isFetchingContent.value = true
     try {
-      userPlaylists.value = await invoke<PlaylistItem[]>('get_user_playlists')
+      const lists = await invoke<PlaylistItem[]>('get_user_playlists')
+      if (lists && lists.length > 0) {
+        userPlaylists.value = lists
+      }
     } catch (err) {
       errorMessage.value = String(err)
     } finally {
@@ -420,7 +832,10 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function loadPlaylistTracks(playlist: PlaylistItem) {
     selectedPlaylistTitle.value = playlist.title
-    if (!isTauriConnected.value) return
+    if (!isTauriConnected.value) {
+      selectedPlaylistTracks.value = homeSections.value.flatMap((s) => s.items)
+      return
+    }
     isFetchingContent.value = true
     try {
       selectedPlaylistTracks.value = await invoke<TrackItem[]>('get_playlist_tracks', {
@@ -451,7 +866,7 @@ export const usePlayerStore = defineStore('player', () => {
       currentTrackArtist.value = chosen.artist
       currentThumbnailUrl.value = chosen.thumbnail_url
       positionSecs.value = 0
-      durationSecs.value = chosen.duration_secs
+      durationSecs.value = chosen.duration_secs || 200
       isPlaying.value = true
     }
   }
@@ -469,11 +884,14 @@ export const usePlayerStore = defineStore('player', () => {
     if (isTauriConnected.value) {
       const state = await invoke<RustPlayerState>('next_track')
       applyRustState(state)
-    } else {
-      queueIndex.value = (queueIndex.value + 1) % DEMO_TRACKS.length
-      currentTrackTitle.value = DEMO_TRACKS[queueIndex.value].title
-      currentTrackArtist.value = DEMO_TRACKS[queueIndex.value].artist
-      videoId.value = DEMO_TRACKS[queueIndex.value].videoId
+    } else if (queue.value.length > 0) {
+      queueIndex.value = (queueIndex.value + 1) % queue.value.length
+      const next = queue.value[queueIndex.value]
+      currentTrackTitle.value = next.title
+      currentTrackArtist.value = next.artist
+      currentThumbnailUrl.value = next.thumbnail_url
+      videoId.value = next.video_id
+      durationSecs.value = next.duration_secs || 200
       positionSecs.value = 0
       isPlaying.value = true
     }
@@ -483,25 +901,14 @@ export const usePlayerStore = defineStore('player', () => {
     if (isTauriConnected.value) {
       const state = await invoke<RustPlayerState>('prev_track')
       applyRustState(state)
-    } else {
-      queueIndex.value = (queueIndex.value + DEMO_TRACKS.length - 1) % DEMO_TRACKS.length
-      currentTrackTitle.value = DEMO_TRACKS[queueIndex.value].title
-      currentTrackArtist.value = DEMO_TRACKS[queueIndex.value].artist
-      videoId.value = DEMO_TRACKS[queueIndex.value].videoId
-      positionSecs.value = 0
-      isPlaying.value = true
-    }
-  }
-
-  async function selectDemoTrack(index: number) {
-    if (isTauriConnected.value) {
-      const state = await invoke<RustPlayerState>('select_demo_track', { index })
-      applyRustState(state)
-    } else {
-      queueIndex.value = index % DEMO_TRACKS.length
-      currentTrackTitle.value = DEMO_TRACKS[queueIndex.value].title
-      currentTrackArtist.value = DEMO_TRACKS[queueIndex.value].artist
-      videoId.value = DEMO_TRACKS[queueIndex.value].videoId
+    } else if (queue.value.length > 0) {
+      queueIndex.value = (queueIndex.value + queue.value.length - 1) % queue.value.length
+      const prev = queue.value[queueIndex.value]
+      currentTrackTitle.value = prev.title
+      currentTrackArtist.value = prev.artist
+      currentThumbnailUrl.value = prev.thumbnail_url
+      videoId.value = prev.video_id
+      durationSecs.value = prev.duration_secs || 200
       positionSecs.value = 0
       isPlaying.value = true
     }
@@ -560,6 +967,9 @@ export const usePlayerStore = defineStore('player', () => {
   }
 
   return {
+    theme,
+    toggleTheme,
+    setTheme,
     isPlaying,
     currentTrackTitle,
     currentTrackArtist,
@@ -577,7 +987,15 @@ export const usePlayerStore = defineStore('player', () => {
     autoplayRadio,
     lowRamNoImages,
     queue,
+    rightPanelOpen,
+    rightPanelTab,
     isQueueDrawerOpen,
+    isFullscreenPlayer,
+    searchFilter,
+    lyrics,
+    isLoadingLyrics,
+    relatedTracks,
+    isLoadingRelated,
     errorMessage,
     isTauriConnected,
     lastSyncTimestamp,
@@ -593,6 +1011,8 @@ export const usePlayerStore = defineStore('player', () => {
     formatTime,
     initStore,
     fetchQueue,
+    fetchLyrics,
+    refreshRelatedTracks,
     playQueueIndex,
     removeFromQueue,
     clearQueue,
@@ -601,6 +1021,14 @@ export const usePlayerStore = defineStore('player', () => {
     toggleAutoplayRadio,
     toggleLowRamImages,
     toggleQueueDrawer,
+    openRightPanel,
+    setRightPanelTab,
+    toggleFullscreenPlayer,
+    isTrackLiked,
+    toggleLikeTrack,
+    addToQueue,
+    startRadioFromTrack,
+    dismissError,
     openLoginWindow,
     setManualCookie,
     logout,
@@ -613,7 +1041,6 @@ export const usePlayerStore = defineStore('player', () => {
     togglePlay,
     nextTrack,
     prevTrack,
-    selectDemoTrack,
     setVolume,
     seekTo,
     playYoutubeVideo,

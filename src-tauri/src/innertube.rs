@@ -37,6 +37,15 @@ pub struct HomeSection {
     pub items: Vec<TrackItem>,
 }
 
+/// Clean, frontend-ready representation of track lyrics fetched from YouTube Music Innertube or LRCLIB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LyricsResponse {
+    pub video_id: String,
+    pub has_lyrics: bool,
+    pub lines: Vec<String>,
+    pub source_label: String,
+}
+
 /// Native Rust client for YouTube Music's internal Innertube (`WEB_REMIX`) API.
 pub struct InnertubeClient {
     http: reqwest::Client,
@@ -121,7 +130,7 @@ impl InnertubeClient {
 }
 
 /// Fetches the YouTube Music Home feed (`FEmusic_home`), returning sections of playable tracks.
-/// Automatically falls back to curated real YouTube Music gaming/music shelves if unauthenticated
+/// Automatically falls back to curated real YouTube Music shelves if unauthenticated
 /// or if Innertube returns empty shelves.
 pub async fn fetch_home(auth: Option<&AuthSession>) -> Result<Vec<HomeSection>, String> {
     let client = InnertubeClient::new()?;
@@ -139,9 +148,33 @@ pub async fn fetch_home(auth: Option<&AuthSession>) -> Result<Vec<HomeSection>, 
     Ok(curated_fallback_home_sections())
 }
 
+/// Maps a user-facing search filter key to the official YouTube Music `WEB_REMIX` `params` token.
+pub fn resolve_search_filter_params(filter: Option<&str>) -> Option<&'static str> {
+    let f = filter?.trim().to_lowercase();
+    match f.as_str() {
+        "" | "all" | "tudo" => None,
+        "songs" | "musicas" | "músicas" => Some("EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D"),
+        "videos" | "vídeos" => Some("EgWKAQIQAWoKEAkQChAFEAMQBA%3D%3D"),
+        "albums" | "albuns" | "álbuns" => Some("EgWKAQIYAWoKEAkQChAFEAMQBA%3D%3D"),
+        "artists" | "artistas" => Some("EgWKAQIgAWoKEAkQChAFEAMQBA%3D%3D"),
+        "playlists" => Some("EgeKAQQoADgBagwQDhAKEAMQBRAJEAQ%3D"),
+        _ => None,
+    }
+}
+
 /// Searches YouTube Music (`youtubei/v1/search`) for songs and videos matching `query`.
 pub async fn search_music(
     query: &str,
+    auth: Option<&AuthSession>,
+) -> Result<Vec<TrackItem>, String> {
+    search_music_filtered(query, None, auth).await
+}
+
+/// Searches YouTube Music (`youtubei/v1/search`) with optional `WEB_REMIX` category filter `params`.
+/// Automatically falls back to an unfiltered search if the filtered query returns empty results.
+pub async fn search_music_filtered(
+    query: &str,
+    filter: Option<&str>,
     auth: Option<&AuthSession>,
 ) -> Result<Vec<TrackItem>, String> {
     let trimmed = query.trim();
@@ -150,6 +183,25 @@ pub async fn search_music(
     }
 
     let client = InnertubeClient::new()?;
+
+    // 1. If a specific filter parameter is requested, try filtered search first
+    if let Some(params) = resolve_search_filter_params(filter) {
+        let filtered_payload = json!({
+            "query": trimmed,
+            "params": params
+        });
+
+        if let Ok(data) = client.post_endpoint("search", filtered_payload, auth).await {
+            let mut tracks = Vec::new();
+            collect_tracks_recursive(&data, &mut tracks);
+            deduplicate_tracks(&mut tracks);
+            if !tracks.is_empty() {
+                return Ok(tracks);
+            }
+        }
+    }
+
+    // 2. Unfiltered search (or automatic fallback if filtered search returned empty)
     let payload = json!({
         "query": trimmed
     });
@@ -163,7 +215,7 @@ pub async fn search_music(
         }
     }
 
-    // Resilient fallback search over curated catalog if network/Innertube is restricted
+    // 3. Resilient fallback search over curated real YouTube Music catalog if offline/restricted
     let lower = trimmed.to_lowercase();
     let mut fallback: Vec<TrackItem> = curated_fallback_home_sections()
         .into_iter()
@@ -202,7 +254,7 @@ pub async fn fetch_liked_music(auth: Option<&AuthSession>) -> Result<Vec<TrackIt
         }
     }
 
-    // Provide default liked/demo tracks when unauthenticated so the user can test playback immediately
+    // Provide curated real YouTube Music tracks when unauthenticated so playback works immediately
     Ok(curated_fallback_liked_tracks())
 }
 
@@ -292,6 +344,260 @@ pub async fn fetch_radio_up_next(
     }
 
     Ok(fallback)
+}
+
+/// Fetches track lyrics via YouTube Music Innertube (`/youtubei/v1/next` -> `MPLYt...` -> `/youtubei/v1/browse`)
+/// and falls back to the public LRCLIB API (`https://lrclib.net/api/...`) when Innertube lyrics are unavailable.
+pub async fn fetch_track_lyrics(
+    video_id: &str,
+    title: Option<&str>,
+    artist: Option<&str>,
+    auth: Option<&AuthSession>,
+) -> Result<LyricsResponse, String> {
+    let trimmed_id = video_id.trim();
+    let client = InnertubeClient::new()?;
+
+    // 1. Try YouTube Music Innertube `/youtubei/v1/next` -> `MPLYt...` -> `/youtubei/v1/browse`
+    if !trimmed_id.is_empty() {
+        let next_payload = json!({
+            "videoId": trimmed_id
+        });
+
+        if let Ok(next_data) = client.post_endpoint("next", next_payload, auth).await {
+            if let Some(lyrics_browse_id) = find_lyrics_browse_id_recursive(&next_data) {
+                let browse_payload = json!({
+                    "browseId": lyrics_browse_id
+                });
+
+                if let Ok(browse_data) = client.post_endpoint("browse", browse_payload, auth).await
+                {
+                    let lines = extract_innertube_lyrics_lines(&browse_data);
+                    if !lines.is_empty() {
+                        return Ok(LyricsResponse {
+                            video_id: trimmed_id.to_string(),
+                            has_lyrics: true,
+                            lines,
+                            source_label: "YouTube Music (Innertube)".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback to public LRCLIB API if title (and optionally artist) are available
+    let clean_title = title.map(|s| s.trim()).unwrap_or("");
+    let clean_artist = artist.map(|s| s.trim()).unwrap_or("");
+
+    if !clean_title.is_empty() {
+        if let Some(lines) = fetch_lrclib_lyrics(&client.http, clean_title, clean_artist).await {
+            if !lines.is_empty() {
+                return Ok(LyricsResponse {
+                    video_id: trimmed_id.to_string(),
+                    has_lyrics: true,
+                    lines,
+                    source_label: "LRCLIB Lyrics".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(LyricsResponse {
+        video_id: trimmed_id.to_string(),
+        has_lyrics: false,
+        lines: Vec::new(),
+        source_label: "Letra indisponível para esta faixa".to_string(),
+    })
+}
+
+fn find_lyrics_browse_id_recursive(node: &Value) -> Option<String> {
+    match node {
+        Value::Object(map) => {
+            if let Some(tab) = map.get("tabRenderer") {
+                let tab_title = tab
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| tab.pointer("/title/runs/0/text").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+
+                let lower_title = tab_title.to_lowercase();
+                if lower_title.contains("lyrics") || lower_title.contains("letra") {
+                    if let Some(bid) = tab
+                        .pointer("/endpoint/browseEndpoint/browseId")
+                        .and_then(|v| v.as_str())
+                    {
+                        if !bid.trim().is_empty() {
+                            return Some(bid.trim().to_string());
+                        }
+                    }
+                }
+            }
+
+            if let Some(browse_ep) = map.get("browseEndpoint") {
+                if let Some(bid) = browse_ep.get("browseId").and_then(|v| v.as_str()) {
+                    if bid.trim().starts_with("MPLYt") {
+                        return Some(bid.trim().to_string());
+                    }
+                }
+            }
+
+            for val in map.values() {
+                if let Some(found) = find_lyrics_browse_id_recursive(val) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                if let Some(found) = find_lyrics_browse_id_recursive(item) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn extract_innertube_lyrics_lines(node: &Value) -> Vec<String> {
+    let mut raw_chunks = Vec::new();
+    collect_lyrics_description_recursive(node, &mut raw_chunks);
+
+    if raw_chunks.is_empty() {
+        return Vec::new();
+    }
+
+    let combined = raw_chunks.join("\n");
+    combined
+        .lines()
+        .map(|l| l.trim().to_string())
+        .collect::<Vec<String>>()
+}
+
+fn collect_lyrics_description_recursive(node: &Value, out: &mut Vec<String>) {
+    match node {
+        Value::Object(map) => {
+            if let Some(shelf) = map.get("musicDescriptionShelfRenderer") {
+                if let Some(runs) = shelf
+                    .pointer("/description/runs")
+                    .and_then(|v| v.as_array())
+                {
+                    let text: String = runs
+                        .iter()
+                        .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
+                        .collect();
+                    if !text.trim().is_empty() {
+                        out.push(text);
+                    }
+                }
+                return;
+            }
+            for val in map.values() {
+                collect_lyrics_description_recursive(val, out);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                collect_lyrics_description_recursive(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn fetch_lrclib_lyrics(
+    http: &reqwest::Client,
+    title: &str,
+    artist: &str,
+) -> Option<Vec<String>> {
+    // 1. Try direct `/api/get` when both artist and title are known
+    if !artist.is_empty()
+        && !artist.eq_ignore_ascii_case("YouTube Music")
+        && !artist.eq_ignore_ascii_case("YouTube Music Radio")
+    {
+        if let Ok(resp) = http
+            .get("https://lrclib.net/api/get")
+            .header("User-Agent", FIREFOX_LINUX_UA)
+            .query(&[("artist_name", artist), ("track_name", title)])
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(json_val) = resp.json::<Value>().await {
+                    if let Some(lines) = parse_lrclib_record(&json_val) {
+                        return Some(lines);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback to `/api/search?q=...`
+    let search_q = if !artist.is_empty()
+        && !artist.eq_ignore_ascii_case("YouTube Music")
+        && !artist.eq_ignore_ascii_case("YouTube Music Radio")
+    {
+        format!("{artist} {title}")
+    } else {
+        title.to_string()
+    };
+
+    if let Ok(resp) = http
+        .get("https://lrclib.net/api/search")
+        .header("User-Agent", FIREFOX_LINUX_UA)
+        .query(&[("q", search_q.as_str())])
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(Value::Array(items)) = resp.json::<Value>().await {
+                for item in &items {
+                    if let Some(lines) = parse_lrclib_record(item) {
+                        return Some(lines);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_lrclib_record(record: &Value) -> Option<Vec<String>> {
+    if let Some(plain) = record.get("plainLyrics").and_then(|v| v.as_str()) {
+        let lines: Vec<String> = plain.lines().map(|l| l.trim().to_string()).collect();
+        if lines.iter().any(|l| !l.is_empty()) {
+            return Some(lines);
+        }
+    }
+
+    if let Some(synced) = record.get("syncedLyrics").and_then(|v| v.as_str()) {
+        let lines: Vec<String> = synced.lines().map(strip_lrc_timestamps).collect();
+        if lines.iter().any(|l| !l.is_empty()) {
+            return Some(lines);
+        }
+    }
+
+    None
+}
+
+fn strip_lrc_timestamps(line: &str) -> String {
+    let mut rest = line.trim();
+    while rest.starts_with('[') {
+        if let Some(close_idx) = rest.find(']') {
+            let inside = &rest[1..close_idx];
+            if inside
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == ':' || c == '.' || c == '-')
+            {
+                rest = rest[close_idx + 1..].trim_start();
+                continue;
+            }
+        }
+        break;
+    }
+    rest.trim().to_string()
 }
 
 // ============================================================================
@@ -385,7 +691,7 @@ fn collect_tracks_recursive(node: &Value, out: &mut Vec<TrackItem>) {
                 return;
             }
             if let Some(renderer) = map.get("musicTwoRowItemRenderer") {
-                if let Some(track) = parse_two_row_item_track(renderer) {
+                if let Some(track) = try_parse_two_row_track(renderer) {
                     out.push(track);
                 }
                 return;
@@ -452,7 +758,7 @@ fn parse_playlist_panel_video_track(renderer: &Value) -> Option<TrackItem> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "3:30".to_string());
 
-    let duration_secs = parse_duration_str(&duration_text).unwrap_or(210.0);
+    let duration_secs = parse_duration_secs(&duration_text).unwrap_or(210.0);
 
     let thumbnail_url = extract_best_thumbnail(renderer)
         .or_else(|| {
@@ -514,7 +820,7 @@ fn parse_responsive_list_item_track(renderer: &Value) -> Option<TrackItem> {
                 .collect();
 
             for token in tokens {
-                if parse_duration_str(&token).is_some() {
+                if looks_like_duration(&token) {
                     duration_text = token;
                 } else if artist.is_empty()
                     && !token.eq_ignore_ascii_case("Música")
@@ -536,7 +842,7 @@ fn parse_responsive_list_item_track(renderer: &Value) -> Option<TrackItem> {
             .pointer("/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text/runs/0/text")
             .and_then(|v| v.as_str())
         {
-            if parse_duration_str(fixed_text.trim()).is_some() {
+            if looks_like_duration(fixed_text.trim()) {
                 duration_text = fixed_text.trim().to_string();
             }
         }
@@ -548,7 +854,7 @@ fn parse_responsive_list_item_track(renderer: &Value) -> Option<TrackItem> {
     if duration_text.is_empty() {
         duration_text = "3:30".to_string();
     }
-    let duration_secs = parse_duration_str(&duration_text).unwrap_or(210.0);
+    let duration_secs = parse_duration_secs(&duration_text).unwrap_or(210.0);
 
     let thumbnail_url = extract_best_thumbnail(renderer)
         .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"));
@@ -564,7 +870,7 @@ fn parse_responsive_list_item_track(renderer: &Value) -> Option<TrackItem> {
     })
 }
 
-fn parse_two_row_item_track(renderer: &Value) -> Option<TrackItem> {
+fn try_parse_two_row_track(renderer: &Value) -> Option<TrackItem> {
     let video_id = renderer
         .pointer("/navigationEndpoint/watchEndpoint/videoId")
         .and_then(|v| v.as_str())
@@ -585,6 +891,8 @@ fn parse_two_row_item_track(renderer: &Value) -> Option<TrackItem> {
     }
 
     let mut artist = String::new();
+    let mut duration_text = String::new();
+
     if let Some(runs) = renderer
         .pointer("/subtitle/runs")
         .and_then(|v| v.as_array())
@@ -592,13 +900,30 @@ fn parse_two_row_item_track(renderer: &Value) -> Option<TrackItem> {
         for run in runs {
             if let Some(t) = run.get("text").and_then(|v| v.as_str()) {
                 let clean = t.trim();
-                if !clean.is_empty()
-                    && clean != "•"
+                if clean.is_empty() || clean == "•" || clean == "-" || clean == "&" || clean == ","
+                {
+                    continue;
+                }
+                if looks_like_duration(clean) {
+                    duration_text = clean.to_string();
+                } else if artist.is_empty()
                     && !clean.eq_ignore_ascii_case("Música")
                     && !clean.eq_ignore_ascii_case("Vídeo")
                     && !clean.eq_ignore_ascii_case("Song")
+                    && !clean.eq_ignore_ascii_case("Video")
                 {
                     artist = clean.to_string();
+                }
+            }
+        }
+    }
+
+    // Also inspect thumbnailOverlay / thumbnailOverlays for a duration badge if subtitle didn't include one
+    if duration_text.is_empty() {
+        for overlay_key in ["thumbnailOverlay", "thumbnailOverlays"] {
+            if let Some(overlay_node) = renderer.get(overlay_key) {
+                if let Some(found_dur) = find_duration_token_recursive(overlay_node) {
+                    duration_text = found_dur;
                     break;
                 }
             }
@@ -609,6 +934,13 @@ fn parse_two_row_item_track(renderer: &Value) -> Option<TrackItem> {
         artist = "YouTube Music".to_string();
     }
 
+    let (duration_text, duration_secs) = if !duration_text.is_empty() {
+        let secs = parse_duration_secs(&duration_text).unwrap_or(210.0);
+        (duration_text, secs)
+    } else {
+        ("3:30".to_string(), 210.0)
+    };
+
     let thumbnail_url = extract_best_thumbnail(renderer)
         .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"));
 
@@ -617,10 +949,40 @@ fn parse_two_row_item_track(renderer: &Value) -> Option<TrackItem> {
         title,
         artist,
         album: String::new(),
-        duration_text: "3:30".to_string(),
-        duration_secs: 210.0,
+        duration_text,
+        duration_secs,
         thumbnail_url,
     })
+}
+
+fn find_duration_token_recursive(node: &Value) -> Option<String> {
+    match node {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if looks_like_duration(trimmed) {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        }
+        Value::Object(map) => {
+            for val in map.values() {
+                if let Some(found) = find_duration_token_recursive(val) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                if let Some(found) = find_duration_token_recursive(item) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn collect_playlists_recursive(node: &Value, out: &mut Vec<PlaylistItem>) {
@@ -785,7 +1147,11 @@ fn extract_best_thumbnail(node: &Value) -> Option<String> {
     None
 }
 
-fn parse_duration_str(text: &str) -> Option<f64> {
+pub fn looks_like_duration(text: &str) -> bool {
+    parse_duration_secs(text).is_some()
+}
+
+pub fn parse_duration_secs(text: &str) -> Option<f64> {
     let parts: Vec<&str> = text.trim().split(':').collect();
     if parts.len() < 2 || parts.len() > 3 {
         return None;

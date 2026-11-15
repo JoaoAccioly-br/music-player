@@ -1,18 +1,22 @@
 pub mod audio;
 pub mod auth;
 pub mod innertube;
+pub mod persistence;
 
 use audio::{
     extract_youtube_audio_stream_cancellable, parse_youtube_video_id, AudioCommand, AudioEngine,
+    ProgressiveAudioBuffer,
 };
 use auth::{
     build_session_from_cookie_str, clear_session_on_disk, load_session_from_disk,
     open_google_login_window, save_session_to_disk, AuthSession, AuthStatus,
 };
 use innertube::{
-    fetch_home, fetch_liked_music, fetch_playlist_tracks, fetch_radio_up_next,
-    fetch_user_playlists, search_music, HomeSection, PlaylistItem, TrackItem,
+    fetch_home, fetch_liked_music, fetch_playlist_tracks, fetch_radio_up_next, fetch_track_lyrics,
+    fetch_user_playlists, search_music_filtered, HomeSection, LyricsResponse, PlaylistItem,
+    TrackItem,
 };
+use persistence::{load_persisted_session, save_persisted_session, PersistedSession};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,26 +27,44 @@ use tauri::{
     AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder, Wry,
 };
 
-/// Static list of real YouTube VOD tracks with real YouTube video IDs and durations:
-/// `(video_id, title, artist, duration_secs)`
-const DEMO_TRACKS: &[(&str, &str, &str, f64)] = &[
-    ("MV_3Dpw-BRY", "Nightcall", "Kavinsky", 258.0),
-    ("fJ9rUzIMcZQ", "Bohemian Rhapsody", "Queen", 355.0),
-    ("4NRXx6U8ABQ", "Blinding Lights", "The Weeknd", 200.0),
-    ("FGBhQbmPwH8", "One More Time", "Daft Punk", 320.0),
+/// Curated initial list of real YouTube Music catalog tracks with verified YouTube video IDs and durations:
+/// `(video_id, title, artist, album, duration_secs)`
+const INITIAL_CATALOG_TRACKS: &[(&str, &str, &str, &str, f64)] = &[
+    ("MV_3Dpw-BRY", "Nightcall", "Kavinsky", "OutRun", 258.0),
+    (
+        "fJ9rUzIMcZQ",
+        "Bohemian Rhapsody",
+        "Queen",
+        "A Night at the Opera",
+        355.0,
+    ),
+    (
+        "4NRXx6U8ABQ",
+        "Blinding Lights",
+        "The Weeknd",
+        "After Hours",
+        200.0,
+    ),
+    (
+        "FGBhQbmPwH8",
+        "One More Time",
+        "Daft Punk",
+        "Discovery",
+        320.0,
+    ),
 ];
 
 fn default_queue_tracks() -> Vec<TrackItem> {
-    DEMO_TRACKS
+    INITIAL_CATALOG_TRACKS
         .iter()
-        .map(|(vid, title, artist, dur)| {
+        .map(|(vid, title, artist, album, dur)| {
             let mins = (*dur as u64) / 60;
             let secs = (*dur as u64) % 60;
             TrackItem {
                 video_id: (*vid).to_string(),
                 title: (*title).to_string(),
                 artist: (*artist).to_string(),
-                album: "YouTube Music Stream".to_string(),
+                album: (*album).to_string(),
                 duration_text: format!("{mins}:{secs:02}"),
                 duration_secs: *dur,
                 thumbnail_url: format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"),
@@ -66,6 +88,14 @@ impl RepeatMode {
             RepeatMode::Off => RepeatMode::All,
             RepeatMode::All => RepeatMode::One,
             RepeatMode::One => RepeatMode::Off,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RepeatMode::Off => "off",
+            RepeatMode::All => "all",
+            RepeatMode::One => "one",
         }
     }
 }
@@ -94,7 +124,7 @@ pub struct PlayerState {
 
 impl Default for PlayerState {
     fn default() -> Self {
-        let (video_id, title, artist, duration_secs) = DEMO_TRACKS[0];
+        let (video_id, title, artist, _album, duration_secs) = INITIAL_CATALOG_TRACKS[0];
         Self {
             is_playing: false,
             current_track_title: title.to_string(),
@@ -102,7 +132,7 @@ impl Default for PlayerState {
             current_thumbnail_url: format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"),
             volume: 0.8,
             queue_index: 0,
-            queue_len: DEMO_TRACKS.len(),
+            queue_len: INITIAL_CATALOG_TRACKS.len(),
             video_id: video_id.to_string(),
             position_secs: 0.0,
             duration_secs,
@@ -135,11 +165,14 @@ impl PlayerState {
     }
 
     pub fn apply_track_from_queue(&mut self, queue: &[TrackItem], index: usize) {
+        self.buffer_size_mb = 0.0;
+
         if queue.is_empty() {
-            let safe_index = index % DEMO_TRACKS.len();
-            let (video_id, title, artist, duration_secs) = DEMO_TRACKS[safe_index];
+            let safe_index = index % INITIAL_CATALOG_TRACKS.len();
+            let (video_id, title, artist, _album, duration_secs) =
+                INITIAL_CATALOG_TRACKS[safe_index];
             self.queue_index = safe_index;
-            self.queue_len = DEMO_TRACKS.len();
+            self.queue_len = INITIAL_CATALOG_TRACKS.len();
             self.video_id = video_id.to_string();
             self.current_track_title = title.to_string();
             self.current_track_artist = artist.to_string();
@@ -165,33 +198,111 @@ impl PlayerState {
 }
 
 /// Shared application container holding the player state, active queue, Google auth session,
-/// dedicated native audio engine thread, tray status menu item handle, deduplicated tray text,
-/// download generation counter (for instant cancellation of stale `yt-dlp` processes), and exit flag.
+/// dedicated native audio engine thread, active progressive audio buffer, tray status menu item handle,
+/// deduplicated tray text, download generation counter (for instant cancellation of stale `yt-dlp` processes),
+/// prefetched next-track RAM buffer, prefetch generation counter, and exit flag.
 pub struct AppContainer {
     pub player: Mutex<PlayerState>,
     pub queue: Mutex<Vec<TrackItem>>,
     pub auth: Mutex<AuthSession>,
     pub audio_engine: AudioEngine,
+    pub active_buffer: Mutex<Option<ProgressiveAudioBuffer>>,
     pub tray_status_item: Mutex<Option<MenuItem<Wry>>>,
     pub last_tray_text: Mutex<String>,
     pub download_generation: Arc<AtomicU64>,
+    pub prefetched_audio: Mutex<Option<(String, audio::ExtractedAudio)>>,
+    pub prefetch_generation: Arc<AtomicU64>,
     pub quit_requested: AtomicBool,
 }
 
 impl Default for AppContainer {
     fn default() -> Self {
         let initial_auth = load_session_from_disk();
+        let audio_engine = AudioEngine::new();
+        let mut player_state = PlayerState::default();
+        let mut initial_queue = default_queue_tracks();
+
+        if let Some(persisted) = load_persisted_session() {
+            let vol = persisted.volume.clamp(0.0, 1.0);
+            player_state.volume = vol;
+            audio_engine.send(AudioCommand::SetVolume(vol));
+
+            player_state.repeat_mode = match persisted.repeat_mode.as_str() {
+                "all" => RepeatMode::All,
+                "one" => RepeatMode::One,
+                _ => RepeatMode::Off,
+            };
+            player_state.autoplay_radio = persisted.autoplay_radio;
+            player_state.low_ram_no_images = persisted.low_ram_no_images;
+
+            if !persisted.queue.is_empty() {
+                initial_queue = persisted.queue;
+            }
+            player_state.apply_track_from_queue(&initial_queue, persisted.queue_index);
+        }
+
         Self {
-            player: Mutex::new(PlayerState::default()),
-            queue: Mutex::new(default_queue_tracks()),
+            player: Mutex::new(player_state),
+            queue: Mutex::new(initial_queue),
             auth: Mutex::new(initial_auth),
-            audio_engine: AudioEngine::new(),
+            audio_engine,
+            active_buffer: Mutex::new(None),
             tray_status_item: Mutex::new(None),
             last_tray_text: Mutex::new(String::new()),
             download_generation: Arc::new(AtomicU64::new(0)),
+            prefetched_audio: Mutex::new(None),
+            prefetch_generation: Arc::new(AtomicU64::new(0)),
             quit_requested: AtomicBool::new(false),
         }
     }
+}
+
+/// Persists the current player state and queue to `~/.local/share/com.ytmusic.rust/player_session.json`.
+fn persist_current_session(app: &AppHandle) {
+    let Some(container) = app.try_state::<AppContainer>() else {
+        return;
+    };
+    let Ok(state) = container.player.lock() else {
+        return;
+    };
+    let Ok(queue) = container.queue.lock() else {
+        return;
+    };
+    let session = PersistedSession {
+        volume: state.volume,
+        repeat_mode: state.repeat_mode.as_str().to_string(),
+        autoplay_radio: state.autoplay_radio,
+        low_ram_no_images: state.low_ram_no_images,
+        theme: "dark".to_string(),
+        queue: queue.clone(),
+        queue_index: state.queue_index,
+    };
+    drop(queue);
+    drop(state);
+    save_persisted_session(&session);
+}
+
+/// Determines the `video_id` of the next track to prefetch into RAM based on the current queue,
+/// active index, and repeat mode.
+pub fn determine_next_video_id(
+    queue: &[TrackItem],
+    current_index: usize,
+    repeat_mode: RepeatMode,
+) -> Option<String> {
+    if queue.is_empty() {
+        return None;
+    }
+    if repeat_mode == RepeatMode::One {
+        // Same song is already in the AudioEngine buffer
+        return None;
+    }
+    if current_index + 1 < queue.len() {
+        return Some(queue[current_index + 1].video_id.clone());
+    }
+    if repeat_mode == RepeatMode::All {
+        return Some(queue[0].video_id.clone());
+    }
+    None
 }
 
 /// Synchronizes state changes with both the native System Tray menu and the WebView (if open).
@@ -242,10 +353,185 @@ fn current_auth_snapshot(app: &AppHandle) -> Option<AuthSession> {
     }
 }
 
+/// Spawns a background task to pre-load (prefetch) the next song in the queue into RAM
+/// (`container.prefetched_audio`). If the user is on the last track of the queue with
+/// `RepeatMode::Off` and `autoplay_radio == true`, proactively fetches Radio recommendations
+/// (`/youtubei/v1/next`), appends them to the queue, and prefetches the first newly added track!
+fn spawn_prefetch_next_track(app: AppHandle) {
+    let Some(container) = app.try_state::<AppContainer>() else {
+        return;
+    };
+
+    let queue_snapshot = container
+        .queue
+        .lock()
+        .map(|q| q.clone())
+        .unwrap_or_default();
+
+    let (current_index, repeat_mode, autoplay_radio, current_video_id) = {
+        let Ok(state) = container.player.lock() else {
+            return;
+        };
+        (
+            state.queue_index,
+            state.repeat_mode,
+            state.autoplay_radio,
+            state.video_id.clone(),
+        )
+    };
+
+    if let Some(next_vid) = determine_next_video_id(&queue_snapshot, current_index, repeat_mode) {
+        let clean_next_vid = parse_youtube_video_id(&next_vid);
+
+        // If `prefetched_audio` already holds this exact `next_vid`, do nothing!
+        if let Ok(guard) = container.prefetched_audio.lock() {
+            if let Some((ref cached_vid, _)) = *guard {
+                if *cached_vid == clean_next_vid || *cached_vid == next_vid {
+                    return;
+                }
+            }
+        }
+
+        let auth_opt = current_auth_snapshot(&app);
+        let prefetch_gen = container.prefetch_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let prefetch_counter = container.prefetch_generation.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let extraction_res = extract_youtube_audio_stream_cancellable(
+                &clean_next_vid,
+                auth_opt.as_ref(),
+                Some((prefetch_gen, prefetch_counter.clone())),
+            )
+            .await;
+
+            if let Ok(extracted) = extraction_res {
+                if prefetch_counter.load(Ordering::SeqCst) != prefetch_gen {
+                    return;
+                }
+                if let Some(c) = app.try_state::<AppContainer>() {
+                    if let Ok(mut guard) = c.prefetched_audio.lock() {
+                        *guard = Some((clean_next_vid, extracted));
+                    }
+                }
+            }
+        });
+    } else if !queue_snapshot.is_empty()
+        && current_index + 1 >= queue_snapshot.len()
+        && repeat_mode == RepeatMode::Off
+        && autoplay_radio
+    {
+        // Last song in the queue with Repeat Off and Autoplay Radio enabled:
+        // Proactively fetch radio recommendations, append to queue, and prefetch the first new song!
+        let auth_opt = current_auth_snapshot(&app);
+        let prefetch_gen = container.prefetch_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let prefetch_counter = container.prefetch_generation.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let Ok(radio_tracks) = fetch_radio_up_next(&current_video_id, auth_opt.as_ref()).await
+            else {
+                return;
+            };
+
+            if prefetch_counter.load(Ordering::SeqCst) != prefetch_gen {
+                return;
+            }
+
+            let Some(c) = app.try_state::<AppContainer>() else {
+                return;
+            };
+
+            let mut updated_queue = Vec::new();
+            let mut updated_state_opt: Option<PlayerState> = None;
+            let mut next_vid_to_prefetch: Option<String> = None;
+
+            {
+                if let Ok(mut q_guard) = c.queue.lock() {
+                    if let Ok(mut state) = c.player.lock() {
+                        // Verify the player is still on the last track with radio enabled
+                        if state.video_id != current_video_id
+                            || state.repeat_mode != RepeatMode::Off
+                            || !state.autoplay_radio
+                        {
+                            return;
+                        }
+
+                        let old_len = q_guard.len();
+                        for track in radio_tracks {
+                            if !q_guard
+                                .iter()
+                                .any(|existing| existing.video_id == track.video_id)
+                            {
+                                q_guard.push(track);
+                            }
+                        }
+
+                        if q_guard.len() > old_len {
+                            state.queue_len = q_guard.len();
+                            updated_queue = q_guard.clone();
+                            updated_state_opt = Some(state.clone());
+                            if state.queue_index + 1 < q_guard.len() {
+                                next_vid_to_prefetch =
+                                    Some(q_guard[state.queue_index + 1].video_id.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !updated_queue.is_empty() {
+                broadcast_queue_change(&app, &updated_queue);
+                persist_current_session(&app);
+            }
+            if let Some(st) = updated_state_opt {
+                broadcast_state_change(&app, &st);
+            }
+
+            if let Some(next_vid) = next_vid_to_prefetch {
+                let clean_next_vid = parse_youtube_video_id(&next_vid);
+
+                // Check if already cached
+                let already_cached = c
+                    .prefetched_audio
+                    .lock()
+                    .ok()
+                    .and_then(|g| {
+                        g.as_ref()
+                            .map(|(vid, _)| *vid == clean_next_vid || *vid == next_vid)
+                    })
+                    .unwrap_or(false);
+                if already_cached {
+                    return;
+                }
+
+                if prefetch_counter.load(Ordering::SeqCst) != prefetch_gen {
+                    return;
+                }
+
+                let extraction_res = extract_youtube_audio_stream_cancellable(
+                    &clean_next_vid,
+                    auth_opt.as_ref(),
+                    Some((prefetch_gen, prefetch_counter.clone())),
+                )
+                .await;
+
+                if let Ok(extracted) = extraction_res {
+                    if prefetch_counter.load(Ordering::SeqCst) != prefetch_gen {
+                        return;
+                    }
+                    if let Ok(mut guard) = c.prefetched_audio.lock() {
+                        *guard = Some((clean_next_vid, extracted));
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// Spawns an asynchronous background task on Tauri's Tokio runtime to extract the real YouTube audio
-/// stream (via isolated `~/.local/share/com.ytmusic.rust/bin/yt-dlp` or Innertube) into a RAM `Vec<u8>`
-/// and feed it to `AudioEngine`. Increments `download_generation` so any previous in-flight `yt-dlp`
-/// process is immediately terminated (`kill_on_drop`).
+/// stream (via isolated `~/.local/share/com.ytmusic.rust/bin/yt-dlp` or Innertube) into a RAM
+/// `ProgressiveAudioBuffer` and feed it to `AudioEngine`. First checks `prefetched_audio` for an
+/// instant RAM Cache Hit! On Cache Miss, cancels any in-flight prefetch and increments
+/// `download_generation` so any previous in-flight `yt-dlp` process is immediately terminated (`kill_on_drop`).
 fn spawn_track_loader(
     app: AppHandle,
     video_id: String,
@@ -253,6 +539,79 @@ fn spawn_track_loader(
     fallback_duration: f64,
     allow_metadata_override: bool,
 ) {
+    let clean_video_id = parse_youtube_video_id(&video_id);
+
+    // 1. Check RAM Prefetch Cache before spawning any download!
+    if let Some(container) = app.try_state::<AppContainer>() {
+        // Cancel any previous active track download
+        container.download_generation.fetch_add(1, Ordering::SeqCst);
+
+        let cached_opt = if let Ok(mut guard) = container.prefetched_audio.lock() {
+            if guard.as_ref().is_some_and(|(cached_vid, _)| {
+                *cached_vid == clean_video_id || *cached_vid == video_id
+            }) {
+                guard.take().map(|(_, audio)| audio)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(extracted) = cached_opt {
+            // RAM Prefetch Cache Hit! Play immediately with zero network wait.
+            let updated = {
+                let mut state = container.player.lock().expect("player mutex poisoned");
+                let buffer_mb = (extracted.data.len() as f32) / (1024.0 * 1024.0);
+                let current_vol = state.volume;
+
+                if let Ok(mut buf_guard) = container.active_buffer.lock() {
+                    *buf_guard = Some(extracted.data.clone());
+                }
+
+                container.audio_engine.send(AudioCommand::LoadAndPlay {
+                    data: extracted.data,
+                    volume: current_vol,
+                });
+
+                if allow_metadata_override {
+                    if let Some(title) = extracted.title {
+                        if !title.trim().is_empty() {
+                            state.current_track_title = title;
+                        }
+                    }
+                    if let Some(author) = extracted.author {
+                        if !author.trim().is_empty() {
+                            state.current_track_artist = author;
+                        }
+                    }
+                }
+
+                if extracted.duration_secs > 1.0 {
+                    state.duration_secs = extracted.duration_secs;
+                } else if fallback_duration > 1.0 {
+                    state.duration_secs = fallback_duration;
+                }
+                state.position_secs = 0.0;
+                state.buffer_size_mb = buffer_mb;
+                state.audio_quality_label =
+                    format!("{} • Prefetch RAM Instantâneo", extracted.quality_label);
+                state.is_loading = false;
+                state.is_playing = true;
+                state.error_message = None;
+                state.clone()
+            };
+
+            broadcast_state_change(&app, &updated);
+            // Immediately trigger background prefetch for the subsequent track (N + 2)!
+            spawn_prefetch_next_track(app);
+            return;
+        }
+
+        // 2. Cache Miss: Cancel any running background prefetch so it doesn't compete for bandwidth/CPU
+        container.prefetch_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
     let auth_opt = current_auth_snapshot(&app);
     let generation_pair = app.try_state::<AppContainer>().map(|c| {
         let gen = c.download_generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -271,10 +630,11 @@ fn spawn_track_loader(
             return;
         };
 
+        let mut loaded_ok = false;
         let updated = {
             let mut state = container.player.lock().expect("player mutex poisoned");
             // Ensure the user hasn't switched to a different video or newer generation while downloading
-            if state.video_id != video_id {
+            if state.video_id != video_id && state.video_id != clean_video_id {
                 return;
             }
             if let Some((expected_gen, ref counter)) = generation_pair {
@@ -285,8 +645,13 @@ fn spawn_track_loader(
 
             match extraction_result {
                 Ok(extracted) => {
+                    loaded_ok = true;
                     let buffer_mb = (extracted.data.len() as f32) / (1024.0 * 1024.0);
                     let current_vol = state.volume;
+
+                    if let Ok(mut buf_guard) = container.active_buffer.lock() {
+                        *buf_guard = Some(extracted.data.clone());
+                    }
 
                     container.audio_engine.send(AudioCommand::LoadAndPlay {
                         data: extracted.data,
@@ -319,6 +684,9 @@ fn spawn_track_loader(
                     state.error_message = None;
                 }
                 Err(err_msg) => {
+                    if let Ok(mut buf_guard) = container.active_buffer.lock() {
+                        *buf_guard = None;
+                    }
                     container.audio_engine.send(AudioCommand::Stop);
                     state.is_loading = false;
                     state.is_playing = false;
@@ -331,6 +699,11 @@ fn spawn_track_loader(
         };
 
         broadcast_state_change(&app, &updated);
+
+        // Once the current track is loaded and playing, prefetch the next track in the background!
+        if loaded_ok {
+            spawn_prefetch_next_track(app);
+        }
     });
 }
 
@@ -387,6 +760,7 @@ fn spawn_radio_continuation(app: AppHandle, seed_video_id: String) {
 
         if !updated_queue.is_empty() {
             broadcast_queue_change(&app, &updated_queue);
+            persist_current_session(&app);
         }
 
         if let Some((updated_state, vid, idx, dur)) = next_play_info {
@@ -396,8 +770,9 @@ fn spawn_radio_continuation(app: AppHandle, seed_video_id: String) {
     });
 }
 
-/// Starts a lightweight background thread that ticks every 500ms to advance `position_secs`
-/// while audio is playing, automatically handling RepeatOne, RepeatAll, Queue Advance, or
+/// Starts a lightweight background thread that ticks every 500ms to synchronize real hardware
+/// `rodio::Sink` telemetry (`get_position_secs()`, `is_track_finished()`) and progressive buffer
+/// growth (`active_buffer`), automatically handling RepeatOne, RepeatAll, Queue Advance, or
 /// Infinite Radio Autoplay (`/youtubei/v1/next`) when a song finishes.
 /// Avoids DBus / System Tray spam on normal 500ms ticks and suppresses IPC emission when the
 /// main WebView window is destroyed in Zero-WebView background mode!
@@ -425,9 +800,31 @@ fn start_progress_ticker(app: AppHandle) {
 
                 if let Ok(mut state) = container.player.lock() {
                     if state.is_playing && !state.is_loading {
-                        state.position_secs += 0.5;
+                        let real_pos = container.audio_engine.get_position_secs();
+                        if real_pos > 0.0 {
+                            state.position_secs = real_pos;
+                        } else {
+                            state.position_secs += 0.5;
+                        }
 
-                        if state.duration_secs > 0.0 && state.position_secs >= state.duration_secs {
+                        if let Ok(buf_guard) = container.active_buffer.lock() {
+                            if let Some(ref buf) = *buf_guard {
+                                state.buffer_size_mb = (buf.len() as f32) / (1024.0 * 1024.0);
+                                if buf.is_finished()
+                                    && state.audio_quality_label.contains("Streaming Progressivo")
+                                    && !state.audio_quality_label.contains("Buffer Completo")
+                                {
+                                    state.audio_quality_label =
+                                        format!("{} • Buffer Completo", state.audio_quality_label);
+                                }
+                            }
+                        }
+
+                        let track_finished = container.audio_engine.is_track_finished()
+                            || (state.duration_secs > 0.0
+                                && state.position_secs >= state.duration_secs);
+
+                        if track_finished {
                             let queue_len = queue_snapshot.len().max(1);
                             match state.repeat_mode {
                                 RepeatMode::One => {
@@ -487,22 +884,23 @@ fn start_progress_ticker(app: AppHandle) {
                 }
             }
 
+            if let Some(state_snapshot) = updated_state {
+                if track_transitioned {
+                    // Track finished / auto-advanced: update tray text (if changed), persist session & update WebView
+                    broadcast_state_change(&app, &state_snapshot);
+                    persist_current_session(&app);
+                } else if app.get_webview_window("main").is_some() {
+                    // Normal 500ms progress tick: only emit IPC event if main window is open; never touch DBus tray!
+                    let _ = app.emit("player-state-changed", &state_snapshot);
+                }
+            }
+
             if let Some((vid, idx, dur)) = auto_advance_info {
                 spawn_track_loader(app.clone(), vid, idx, dur, false);
             }
 
             if let Some(seed_vid) = trigger_radio_for_video {
                 spawn_radio_continuation(app.clone(), seed_vid);
-            }
-
-            if let Some(state_snapshot) = updated_state {
-                if track_transitioned {
-                    // Track finished / auto-advanced: update tray text (if changed) & WebView (if open)
-                    broadcast_state_change(&app, &state_snapshot);
-                } else if app.get_webview_window("main").is_some() {
-                    // Normal 500ms progress tick: only emit IPC event if main window is open; never touch DBus tray!
-                    let _ = app.emit("player-state-changed", &state_snapshot);
-                }
             }
         })
         .expect("failed to spawn progress ticker thread");
@@ -561,11 +959,13 @@ fn toggle_play(app: AppHandle, container: State<'_, AppContainer>) -> PlayerStat
         state.clone()
     };
 
+    broadcast_state_change(&app, &updated);
+
     if let Some((vid, idx, dur)) = needs_initial_load {
-        spawn_track_loader(app.clone(), vid, idx, dur, false);
+        spawn_track_loader(app, vid, idx, dur, false);
+        return get_player_state(container);
     }
 
-    broadcast_state_change(&app, &updated);
     updated
 }
 
@@ -614,11 +1014,13 @@ fn next_track(app: AppHandle, container: State<'_, AppContainer>) -> PlayerState
     };
 
     broadcast_state_change(&app, &updated);
+    persist_current_session(&app);
 
     if let Some(seed_vid) = trigger_radio_vid {
         spawn_radio_continuation(app, seed_vid);
     } else if let Some((vid, idx, dur)) = track_to_load {
         spawn_track_loader(app, vid, idx, dur, false);
+        return get_player_state(container);
     }
 
     updated
@@ -646,37 +1048,9 @@ fn prev_track(app: AppHandle, container: State<'_, AppContainer>) -> PlayerState
         )
     };
     broadcast_state_change(&app, &updated);
+    persist_current_session(&app);
     spawn_track_loader(app, vid, idx, dur, false);
-    updated
-}
-
-#[tauri::command]
-fn select_demo_track(
-    app: AppHandle,
-    container: State<'_, AppContainer>,
-    index: usize,
-) -> PlayerState {
-    let demo_queue = default_queue_tracks();
-    if let Ok(mut q_guard) = container.queue.lock() {
-        *q_guard = demo_queue.clone();
-    }
-
-    let (updated, vid, idx, dur) = {
-        let mut state = container.player.lock().expect("player mutex poisoned");
-        state.apply_track_from_queue(&demo_queue, index);
-        state.is_loading = true;
-        state.is_playing = true;
-        (
-            state.clone(),
-            state.video_id.clone(),
-            state.queue_index,
-            state.duration_secs,
-        )
-    };
-    broadcast_queue_change(&app, &demo_queue);
-    broadcast_state_change(&app, &updated);
-    spawn_track_loader(app, vid, idx, dur, false);
-    updated
+    get_player_state(container)
 }
 
 #[tauri::command]
@@ -711,8 +1085,9 @@ fn play_track_list(
 
     broadcast_queue_change(&app, &active_queue);
     broadcast_state_change(&app, &updated);
+    persist_current_session(&app);
     spawn_track_loader(app, vid, idx, dur, false);
-    updated
+    get_player_state(container)
 }
 
 #[tauri::command]
@@ -726,6 +1101,7 @@ fn set_volume(app: AppHandle, container: State<'_, AppContainer>, volume: f32) -
         state.clone()
     };
     broadcast_state_change(&app, &updated);
+    persist_current_session(&app);
     updated
 }
 
@@ -765,6 +1141,7 @@ fn play_youtube_video(
             .unwrap_or_else(|| "YouTube Music Direct Stream".to_string());
         state.current_thumbnail_url = format!("https://i.ytimg.com/vi/{clean_id}/hqdefault.jpg");
         state.position_secs = 0.0;
+        state.buffer_size_mb = 0.0;
         state.is_loading = true;
         state.is_playing = true;
         state.error_message = None;
@@ -773,7 +1150,7 @@ fn play_youtube_video(
 
     broadcast_state_change(&app, &updated);
     spawn_track_loader(app, clean_id, idx, dur, !has_custom_title);
-    updated
+    get_player_state(container)
 }
 
 // ============================================================================
@@ -815,8 +1192,9 @@ fn play_queue_index(
     };
 
     broadcast_state_change(&app, &updated);
+    persist_current_session(&app);
     spawn_track_loader(app, vid, idx, dur, false);
-    updated
+    get_player_state(container)
 }
 
 #[tauri::command]
@@ -827,6 +1205,7 @@ fn remove_from_queue(
 ) -> Vec<TrackItem> {
     let mut updated_queue = Vec::new();
     let mut updated_state: Option<PlayerState> = None;
+    let mut should_prefetch = false;
 
     if let Ok(mut q_guard) = container.queue.lock() {
         if index < q_guard.len() && q_guard.len() > 1 {
@@ -838,6 +1217,7 @@ fn remove_from_queue(
                     state.queue_index = q_guard.len().saturating_sub(1);
                 }
                 state.queue_len = q_guard.len();
+                should_prefetch = !state.is_loading && state.buffer_size_mb > 0.0;
                 updated_state = Some(state.clone());
             }
         }
@@ -848,6 +1228,10 @@ fn remove_from_queue(
     if let Some(st) = updated_state {
         broadcast_state_change(&app, &st);
     }
+    persist_current_session(&app);
+    if should_prefetch {
+        spawn_prefetch_next_track(app);
+    }
     updated_queue
 }
 
@@ -855,6 +1239,7 @@ fn remove_from_queue(
 fn clear_queue(app: AppHandle, container: State<'_, AppContainer>) -> Vec<TrackItem> {
     let mut updated_queue = Vec::new();
     let mut updated_state: Option<PlayerState> = None;
+    let mut should_prefetch = false;
 
     if let Ok(mut q_guard) = container.queue.lock() {
         if let Ok(mut state) = container.player.lock() {
@@ -868,6 +1253,7 @@ fn clear_queue(app: AppHandle, container: State<'_, AppContainer>) -> Vec<TrackI
                 state.queue_index = 0;
                 state.queue_len = q_guard.len();
             }
+            should_prefetch = !state.is_loading && state.buffer_size_mb > 0.0;
             updated_state = Some(state.clone());
         }
         updated_queue = q_guard.clone();
@@ -877,6 +1263,10 @@ fn clear_queue(app: AppHandle, container: State<'_, AppContainer>) -> Vec<TrackI
     if let Some(st) = updated_state {
         broadcast_state_change(&app, &st);
     }
+    persist_current_session(&app);
+    if should_prefetch {
+        spawn_prefetch_next_track(app);
+    }
     updated_queue
 }
 
@@ -884,6 +1274,7 @@ fn clear_queue(app: AppHandle, container: State<'_, AppContainer>) -> Vec<TrackI
 fn shuffle_queue(app: AppHandle, container: State<'_, AppContainer>) -> Vec<TrackItem> {
     let mut updated_queue = Vec::new();
     let mut updated_state: Option<PlayerState> = None;
+    let mut should_prefetch = false;
 
     if let Ok(mut q_guard) = container.queue.lock() {
         if q_guard.len() > 2 {
@@ -916,6 +1307,7 @@ fn shuffle_queue(app: AppHandle, container: State<'_, AppContainer>) -> Vec<Trac
             if let Ok(mut state) = container.player.lock() {
                 state.queue_index = 0;
                 state.queue_len = q_guard.len();
+                should_prefetch = !state.is_loading && state.buffer_size_mb > 0.0;
                 updated_state = Some(state.clone());
             }
         }
@@ -926,28 +1318,42 @@ fn shuffle_queue(app: AppHandle, container: State<'_, AppContainer>) -> Vec<Trac
     if let Some(st) = updated_state {
         broadcast_state_change(&app, &st);
     }
+    persist_current_session(&app);
+    if should_prefetch {
+        spawn_prefetch_next_track(app);
+    }
     updated_queue
 }
 
 #[tauri::command]
 fn cycle_repeat_mode(app: AppHandle, container: State<'_, AppContainer>) -> PlayerState {
-    let updated = {
+    let (updated, should_prefetch) = {
         let mut state = container.player.lock().expect("player mutex poisoned");
         state.repeat_mode = state.repeat_mode.cycle();
-        state.clone()
+        let prefetch = !state.is_loading && state.buffer_size_mb > 0.0;
+        (state.clone(), prefetch)
     };
     broadcast_state_change(&app, &updated);
+    persist_current_session(&app);
+    if should_prefetch {
+        spawn_prefetch_next_track(app);
+    }
     updated
 }
 
 #[tauri::command]
 fn toggle_autoplay_radio(app: AppHandle, container: State<'_, AppContainer>) -> PlayerState {
-    let updated = {
+    let (updated, should_prefetch) = {
         let mut state = container.player.lock().expect("player mutex poisoned");
         state.autoplay_radio = !state.autoplay_radio;
-        state.clone()
+        let prefetch = !state.is_loading && state.buffer_size_mb > 0.0;
+        (state.clone(), prefetch)
     };
     broadcast_state_change(&app, &updated);
+    persist_current_session(&app);
+    if should_prefetch {
+        spawn_prefetch_next_track(app);
+    }
     updated
 }
 
@@ -959,11 +1365,12 @@ fn toggle_low_ram_images(app: AppHandle, container: State<'_, AppContainer>) -> 
         state.clone()
     };
     broadcast_state_change(&app, &updated);
+    persist_current_session(&app);
     updated
 }
 
 // ============================================================================
-// Phase 3 Commands: Google Auth (`SAPISIDHASH`) & Innertube API
+// Phase 3 Commands: Google Auth (`SAPISIDHASH`), Innertube API & Lyrics
 // ============================================================================
 
 #[tauri::command]
@@ -1035,6 +1442,7 @@ async fn get_home_feed(container: State<'_, AppContainer>) -> Result<Vec<HomeSec
 async fn search_youtube_music(
     container: State<'_, AppContainer>,
     query: String,
+    filter: Option<String>,
 ) -> Result<Vec<TrackItem>, String> {
     let auth_opt = container
         .auth
@@ -1042,7 +1450,38 @@ async fn search_youtube_music(
         .ok()
         .filter(|a| a.is_authenticated)
         .map(|a| a.clone());
-    search_music(&query, auth_opt.as_ref()).await
+    search_music_filtered(&query, filter.as_deref(), auth_opt.as_ref()).await
+}
+
+#[tauri::command]
+async fn search_ytm(
+    container: State<'_, AppContainer>,
+    query: String,
+    filter: Option<String>,
+) -> Result<Vec<TrackItem>, String> {
+    search_youtube_music(container, query, filter).await
+}
+
+#[tauri::command]
+async fn get_track_lyrics(
+    container: State<'_, AppContainer>,
+    video_id: String,
+    title: Option<String>,
+    artist: Option<String>,
+) -> Result<LyricsResponse, String> {
+    let auth_opt = container
+        .auth
+        .lock()
+        .ok()
+        .filter(|a| a.is_authenticated)
+        .map(|a| a.clone());
+    fetch_track_lyrics(
+        &video_id,
+        title.as_deref(),
+        artist.as_deref(),
+        auth_opt.as_ref(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1170,8 +1609,10 @@ fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
                 show_or_recreate_main_window(app);
             }
             "quit" => {
+                persist_current_session(app);
                 let container = app.state::<AppContainer>();
                 container.download_generation.fetch_add(1, Ordering::SeqCst);
+                container.prefetch_generation.fetch_add(1, Ordering::SeqCst);
                 container.audio_engine.send(AudioCommand::Stop);
                 container.quit_requested.store(true, Ordering::SeqCst);
                 app.exit(0);
@@ -1215,7 +1656,6 @@ pub fn run() {
             toggle_play,
             next_track,
             prev_track,
-            select_demo_track,
             play_track_list,
             set_volume,
             seek_to,
@@ -1234,6 +1674,8 @@ pub fn run() {
             logout_auth,
             get_home_feed,
             search_youtube_music,
+            search_ytm,
+            get_track_lyrics,
             get_liked_music,
             get_user_playlists,
             get_playlist_tracks,
@@ -1257,4 +1699,51 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_determine_next_video_id_modes() {
+        let queue = default_queue_tracks();
+        assert_eq!(queue.len(), 4);
+
+        // Empty queue -> None
+        assert_eq!(determine_next_video_id(&[], 0, RepeatMode::Off), None);
+
+        // RepeatMode::One -> None (already in RAM buffer)
+        assert_eq!(determine_next_video_id(&queue, 0, RepeatMode::One), None);
+
+        // Middle of queue -> next track (index + 1)
+        assert_eq!(
+            determine_next_video_id(&queue, 0, RepeatMode::Off),
+            Some(queue[1].video_id.clone())
+        );
+        assert_eq!(
+            determine_next_video_id(&queue, 2, RepeatMode::All),
+            Some(queue[3].video_id.clone())
+        );
+
+        // End of queue with RepeatMode::All -> wraps to index 0
+        assert_eq!(
+            determine_next_video_id(&queue, 3, RepeatMode::All),
+            Some(queue[0].video_id.clone())
+        );
+
+        // End of queue with RepeatMode::Off -> None (handled by Radio Autoplay prefetch if enabled)
+        assert_eq!(determine_next_video_id(&queue, 3, RepeatMode::Off), None);
+    }
+
+    #[test]
+    fn test_apply_track_resets_buffer_size() {
+        let queue = default_queue_tracks();
+        let mut state = PlayerState::default();
+        state.buffer_size_mb = 3.5;
+        state.apply_track_from_queue(&queue, 1);
+        assert_eq!(state.buffer_size_mb, 0.0);
+        assert_eq!(state.queue_index, 1);
+        assert_eq!(state.video_id, queue[1].video_id);
+    }
 }

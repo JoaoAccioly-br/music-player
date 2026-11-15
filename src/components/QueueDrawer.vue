@@ -1,156 +1,347 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import {
-  ListMusic,
-  Music2,
-  Play,
+  Loader2,
+  Maximize2,
+  Plus,
   Radio,
+  Repeat,
+  Repeat1,
   Shuffle,
   Trash2,
-  Volume2,
   X,
 } from 'lucide-vue-next'
-import { usePlayerStore } from '../stores/player'
+import {
+  getPastelGradient,
+  usePlayerStore,
+  type RightPanelTab,
+} from '../stores/player'
+
+withDefaults(
+  defineProps<{
+    embedded?: boolean
+  }>(),
+  {
+    embedded: false,
+  }
+)
 
 const player = usePlayerStore()
+
+const tabs: Array<{ id: RightPanelTab; label: string }> = [
+  { id: 'queue', label: 'A seguir' },
+  { id: 'lyrics', label: 'Letra' },
+  { id: 'related', label: 'Relacionados' },
+]
+
+const activeLyricIndex = computed(() => {
+  const lines = player.lyrics?.lines ?? []
+  if (!lines.length) return 0
+  const dur = Math.max(1, player.durationSecs || 200)
+  const ratio = Math.min(0.99, Math.max(0, player.positionSecs / dur))
+  return Math.floor(ratio * lines.length)
+})
+
+function seekToLyricLine(lineIdx: number) {
+  const lines = player.lyrics?.lines ?? []
+  if (!lines.length) return
+  const targetSec = (lineIdx / lines.length) * (player.durationSecs || 200)
+  player.seekTo(targetSec)
+}
 </script>
 
 <template>
   <aside
-    v-if="player.isQueueDrawerOpen"
-    class="w-80 sm:w-96 bg-[#0a0a0a] border-l border-zinc-800/90 flex flex-col shrink-0 h-full z-20 shadow-2xl"
+    v-if="embedded || player.rightPanelOpen"
+    :class="[
+      'flex flex-col overflow-hidden transition-colors duration-200',
+      embedded
+        ? 'w-full h-full rounded-3xl bg-white/90 dark:bg-[#1E1A2D]/95 border border-[rgba(120,100,180,0.14)] dark:border-white/[0.08] shadow-xl'
+        : 'w-80 sm:w-96 shrink-0 h-full border-l border-[rgba(120,100,180,0.12)] dark:border-white/[0.07] bg-[#FAF9FC]/95 dark:bg-[#161321]/95 backdrop-blur-xl z-20',
+    ]"
   >
-    <!-- Drawer Header -->
-    <div class="p-4 border-b border-zinc-800/80 space-y-3">
-      <div class="flex items-center justify-between">
-        <div class="flex items-center gap-2">
-          <ListMusic class="w-4 h-4 text-red-500" />
-          <h3 class="text-sm font-bold text-white">Fila de Reprodução (Up Next)</h3>
-          <span
-            class="px-2 py-0.5 rounded-full bg-zinc-800 text-[11px] text-zinc-300 font-medium tabular-nums"
-          >
-            {{ player.queue.length }} faixas
-          </span>
-        </div>
+    <!-- Top 3-Tab Pill Switcher: A seguir | Letra | Relacionados -->
+    <div class="p-4 pb-2 flex items-center justify-between gap-2">
+      <div
+        class="flex-1 grid grid-cols-3 p-1 rounded-full bg-[#EDE9F5] dark:bg-[#12101B] border border-[rgba(120,100,180,0.1)] dark:border-white/[0.06]"
+      >
         <button
-          @click="player.toggleQueueDrawer()"
-          class="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
-          title="Fechar Fila"
-        >
-          <X class="w-4 h-4" />
-        </button>
-      </div>
-
-      <!-- Queue Action Bar: Shuffle, Autoplay Radio, Clear -->
-      <div class="flex items-center gap-2">
-        <button
-          @click="player.shuffleQueue()"
-          class="flex-1 py-1.5 px-2.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-xs text-zinc-200 font-medium flex items-center justify-center gap-1.5 transition-colors"
-          title="Embaralhar fila mantendo a música atual no topo"
-        >
-          <Shuffle class="w-3.5 h-3.5 text-red-400" />
-          <span>Embaralhar</span>
-        </button>
-
-        <button
-          @click="player.toggleAutoplayRadio()"
+          v-for="t in tabs"
+          :key="t.id"
+          type="button"
+          @click="player.setRightPanelTab(t.id)"
           :class="[
-            'flex-1 py-1.5 px-2.5 rounded-lg border text-xs font-medium flex items-center justify-center gap-1.5 transition-colors',
-            player.autoplayRadio
-              ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-300'
-              : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200',
+            'py-1.5 px-2 rounded-full text-xs font-semibold transition-all text-center',
+            player.rightPanelTab === t.id
+              ? 'bg-white dark:bg-[#2B2540] text-[#1A162B] dark:text-[#F4F2FA] shadow-sm'
+              : 'text-[#6E6885] dark:text-[#9B94B2] hover:text-[#1A162B] dark:hover:text-white',
           ]"
-          title="Busca automática via /youtubei/v1/next quando a fila chega ao fim"
         >
-          <Radio class="w-3.5 h-3.5" />
-          <span>Rádio {{ player.autoplayRadio ? 'ON' : 'OFF' }}</span>
-        </button>
-
-        <button
-          @click="player.clearQueue()"
-          class="py-1.5 px-2.5 rounded-lg bg-zinc-900 hover:bg-red-950/60 border border-zinc-800 hover:border-red-500/40 text-xs text-zinc-400 hover:text-red-300 font-medium flex items-center justify-center gap-1 transition-colors"
-          title="Limpar próximas faixas da fila"
-        >
-          <Trash2 class="w-3.5 h-3.5" />
-          <span>Limpar</span>
+          {{ t.label }}
         </button>
       </div>
+
+      <button
+        v-if="!embedded"
+        type="button"
+        @click="player.rightPanelOpen = false"
+        title="Fechar painel"
+        class="w-7 h-7 rounded-full flex items-center justify-center text-[#6E6885] dark:text-[#9B94B2] hover:text-[#1A162B] dark:hover:text-white hover:bg-black/5 dark:hover:bg-white/10 transition-colors shrink-0"
+      >
+        <X class="w-4 h-4" />
+      </button>
     </div>
 
-    <!-- Scrollable Queue List -->
-    <div class="flex-1 overflow-y-auto divide-y divide-zinc-800/50">
-      <div
-        v-for="(item, idx) in player.queue"
-        :key="item.video_id + '-' + idx"
-        @click="player.playQueueIndex(idx)"
-        :class="[
-          'group flex items-center justify-between px-4 py-2.5 cursor-pointer transition-colors',
-          idx === player.queueIndex
-            ? 'bg-red-950/35 border-l-2 border-l-red-500'
-            : 'hover:bg-zinc-900/80',
-        ]"
-      >
-        <div class="flex items-center gap-3 min-w-0">
-          <!-- Track Index or Playing Indicator -->
-          <div class="w-5 text-center shrink-0">
-            <Volume2
-              v-if="idx === player.queueIndex && player.isPlaying"
-              class="w-4 h-4 text-red-400 mx-auto animate-pulse"
-            />
-            <Play
-              v-else-if="idx === player.queueIndex"
-              class="w-3.5 h-3.5 text-red-400 mx-auto fill-current"
-            />
-            <span v-else class="text-xs text-zinc-500 tabular-nums">{{ idx + 1 }}</span>
-          </div>
-
-          <!-- Thumbnail or Ultra-Low-RAM Placeholder -->
-          <div
-            class="w-9 h-9 rounded bg-zinc-800 overflow-hidden shrink-0 flex items-center justify-center"
+    <!-- ==================== TAB 1: A SEGUIR (QUEUE) ==================== -->
+    <template v-if="player.rightPanelTab === 'queue'">
+      <!-- Queue Subheader -->
+      <div class="px-4 py-2 flex items-center justify-between text-xs">
+        <span class="text-[#6E6885] dark:text-[#9B94B2] font-medium">
+          {{ player.queue.length }} faixas •
+          <button
+            type="button"
+            @click="player.toggleAutoplayRadio()"
+            :class="[
+              'hover:underline font-medium',
+              player.autoplayRadio
+                ? 'text-[#16A34A] dark:text-[#4ADE80]'
+                : 'text-[#6E6885] dark:text-[#9B94B2]',
+            ]"
           >
-            <img
-              v-if="item.thumbnail_url && !player.lowRamNoImages"
-              :src="item.thumbnail_url"
-              :alt="item.title"
-              loading="lazy"
-              decoding="async"
-              class="w-full h-full object-cover"
-            />
-            <Music2 v-else class="w-4 h-4 text-zinc-400" />
-          </div>
+            Rádio {{ player.autoplayRadio ? 'ligada' : 'desligada' }}
+          </button>
+        </span>
 
-          <!-- Track Title & Artist -->
-          <div class="min-w-0">
-            <p
-              :class="[
-                'text-xs font-semibold truncate',
-                idx === player.queueIndex ? 'text-red-400' : 'text-zinc-200',
-              ]"
-            >
-              {{ item.title }}
-            </p>
-            <p class="text-[11px] text-zinc-400 truncate">{{ item.artist }}</p>
-          </div>
-        </div>
+        <div class="flex items-center gap-1">
+          <button
+            type="button"
+            @click="player.shuffleQueue()"
+            title="Embaralhar fila"
+            class="p-1.5 rounded-lg bg-[#EDE9F5]/80 dark:bg-[#252038] text-[#6E6885] dark:text-[#9B94B2] hover:text-[#1A162B] dark:hover:text-white transition-colors"
+          >
+            <Shuffle class="w-3.5 h-3.5" />
+          </button>
 
-        <!-- Duration & Remove Button -->
-        <div class="flex items-center gap-2 shrink-0 ml-2">
-          <span class="text-[11px] text-zinc-500 tabular-nums">{{ item.duration_text }}</span>
+          <button
+            type="button"
+            @click="player.cycleRepeatMode()"
+            :title="
+              player.repeatMode === 'one'
+                ? 'Repetir 1 faixa'
+                : player.repeatMode === 'all'
+                  ? 'Repetir fila'
+                  : 'Repetição desativada'
+            "
+            :class="[
+              'p-1.5 rounded-lg transition-colors',
+              player.repeatMode !== 'off'
+                ? 'bg-[#7C5CFC]/20 text-[#7C5CFC] dark:text-[#B497FF]'
+                : 'bg-[#EDE9F5]/80 dark:bg-[#252038] text-[#6E6885] dark:text-[#9B94B2] hover:text-[#1A162B] dark:hover:text-white',
+            ]"
+          >
+            <Repeat1 v-if="player.repeatMode === 'one'" class="w-3.5 h-3.5" />
+            <Repeat v-else class="w-3.5 h-3.5" />
+          </button>
+
           <button
             v-if="player.queue.length > 1"
-            @click.stop="player.removeFromQueue(idx)"
-            class="p-1 rounded text-zinc-500 hover:text-red-400 hover:bg-zinc-800 opacity-0 group-hover:opacity-100 transition-opacity"
-            title="Remover da fila"
+            type="button"
+            @click="player.clearQueue()"
+            title="Limpar próximas faixas"
+            class="p-1.5 rounded-lg bg-[#EDE9F5]/80 dark:bg-[#252038] text-[#6E6885] dark:text-[#9B94B2] hover:text-rose-500 transition-colors"
           >
-            <X class="w-3.5 h-3.5" />
+            <Trash2 class="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
-    </div>
 
-    <!-- Footer Info on Autoplay Radio -->
-    <div class="p-3 bg-zinc-950 border-t border-zinc-800/80 text-[11px] text-zinc-400 leading-relaxed">
-      <span class="text-emerald-400 font-semibold">Autoplay `/youtubei/v1/next`:</span>
-      Quando a última música terminar, o Rust buscará recomendações de Rádio automaticamente.
-    </div>
+      <!-- Queue Tracks List -->
+      <div class="flex-1 overflow-y-auto px-3 py-1 space-y-1">
+        <div
+          v-for="(item, idx) in player.queue"
+          :key="item.video_id + '-' + idx"
+          @click="player.playQueueIndex(idx)"
+          :class="[
+            'group flex items-center justify-between gap-2.5 p-2 rounded-2xl cursor-pointer transition-all',
+            idx === player.queueIndex
+              ? 'bg-[#EBE4FF] dark:bg-[#2B224B] border border-[#7C5CFC]/25 dark:border-[#8B6EFF]/35 shadow-sm'
+              : 'hover:bg-white/70 dark:hover:bg-[#1E1A2D]/70 border border-transparent',
+          ]"
+        >
+          <div class="flex items-center gap-2.5 min-w-0">
+            <!-- Pastel Cover / Thumbnail -->
+            <div
+              :class="[
+                'w-9 h-9 rounded-xl overflow-hidden shrink-0 flex items-center justify-center bg-gradient-to-br shadow-sm',
+                getPastelGradient(item.video_id + item.title),
+              ]"
+            >
+              <img
+                v-if="item.thumbnail_url && !player.lowRamNoImages"
+                :src="item.thumbnail_url"
+                :alt="item.title"
+                loading="lazy"
+                decoding="async"
+                class="w-full h-full object-cover"
+              />
+            </div>
+
+            <div class="min-w-0">
+              <p
+                :class="[
+                  'text-xs font-semibold truncate',
+                  idx === player.queueIndex
+                    ? 'text-[#6D4AFF] dark:text-[#C4B5FD]'
+                    : 'text-[#1A162B] dark:text-[#F4F2FA]',
+                ]"
+              >
+                {{ item.title }}
+              </p>
+              <p class="text-[11px] text-[#6E6885] dark:text-[#9B94B2] truncate">
+                {{ item.artist }}
+              </p>
+            </div>
+          </div>
+
+          <div class="flex items-center gap-1.5 shrink-0">
+            <span class="text-[11px] text-[#6E6885] dark:text-[#9B94B2] tabular-nums">
+              {{ item.duration_text || '3:30' }}
+            </span>
+            <button
+              v-if="player.queue.length > 1"
+              type="button"
+              @click.stop="player.removeFromQueue(idx)"
+              title="Remover da fila"
+              class="p-1 rounded-full text-[#6E6885] hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-opacity"
+            >
+              <X class="w-3 h-3" />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Radio Autoplay Footer Notice (matches green box in mockup) -->
+      <div class="p-3.5 pt-2">
+        <div
+          class="p-3 rounded-2xl bg-[#22C55E]/10 dark:bg-[#22C55E]/12 border border-[#22C55E]/25 text-[#15803D] dark:text-[#86EFAC] text-[11px] leading-relaxed"
+        >
+          Quando a fila acabar, a Rádio continua com músicas parecidas.
+        </div>
+      </div>
+    </template>
+
+    <!-- ==================== TAB 2: LETRA (LYRICS) ==================== -->
+    <template v-else-if="player.rightPanelTab === 'lyrics'">
+      <div class="px-4 py-2 flex items-center justify-between text-xs">
+        <span class="text-[#6E6885] dark:text-[#9B94B2] truncate">
+          {{ player.lyrics?.sourceLabel || 'Sincronizada com a música' }}
+        </span>
+        <button
+          v-if="!embedded"
+          type="button"
+          @click="player.toggleFullscreenPlayer('lyrics')"
+          class="text-[#7C5CFC] dark:text-[#B497FF] hover:underline font-medium flex items-center gap-1 shrink-0"
+        >
+          <Maximize2 class="w-3 h-3" />
+          <span>Expandir</span>
+        </button>
+      </div>
+
+      <div
+        v-if="player.isLoadingLyrics"
+        class="flex-1 flex flex-col items-center justify-center gap-2 text-[#6E6885] dark:text-[#9B94B2] p-6"
+      >
+        <Loader2 class="w-5 h-5 animate-spin text-[#7C5CFC]" />
+        <span class="text-xs">Buscando letra de {{ player.currentTrackTitle }}...</span>
+      </div>
+
+      <div
+        v-else
+        class="flex-1 overflow-y-auto px-5 py-4 space-y-3.5"
+      >
+        <p
+          v-for="(line, idx) in player.lyrics?.lines || []"
+          :key="idx"
+          @click="seekToLyricLine(idx)"
+          :class="[
+            'cursor-pointer transition-all duration-300 leading-relaxed',
+            idx === activeLyricIndex
+              ? 'text-base sm:text-lg font-bold text-[#1A162B] dark:text-white'
+              : idx < activeLyricIndex
+                ? 'text-xs sm:text-sm font-medium text-[#6E6885]/55 dark:text-[#9B94B2]/45 hover:text-[#1A162B] dark:hover:text-white'
+                : 'text-xs sm:text-sm font-medium text-[#6E6885] dark:text-[#9B94B2]/80 hover:text-[#1A162B] dark:hover:text-white',
+          ]"
+        >
+          {{ line }}
+        </p>
+      </div>
+    </template>
+
+    <!-- ==================== TAB 3: RELACIONADOS (RELATED) ==================== -->
+    <template v-else>
+      <div class="px-4 py-2 flex items-center justify-between text-xs">
+        <span class="text-[#6E6885] dark:text-[#9B94B2] truncate">
+          Similares a {{ player.currentTrackArtist }}
+        </span>
+        <button
+          type="button"
+          @click="player.startRadioFromTrack()"
+          class="text-[#7C5CFC] dark:text-[#B497FF] hover:underline font-semibold flex items-center gap-1 shrink-0"
+        >
+          <Radio class="w-3 h-3" />
+          <span>Iniciar rádio</span>
+        </button>
+      </div>
+
+      <div class="flex-1 overflow-y-auto px-3 py-1 space-y-1">
+        <div
+          v-for="(item, idx) in player.relatedTracks"
+          :key="item.video_id + '-rel-' + idx"
+          @click="player.playTrackList(player.relatedTracks, idx)"
+          class="group flex items-center justify-between gap-2.5 p-2 rounded-2xl hover:bg-white/70 dark:hover:bg-[#1E1A2D]/70 cursor-pointer transition-all"
+        >
+          <div class="flex items-center gap-2.5 min-w-0">
+            <div
+              :class="[
+                'w-9 h-9 rounded-xl overflow-hidden shrink-0 flex items-center justify-center bg-gradient-to-br shadow-sm',
+                getPastelGradient(item.video_id + item.title),
+              ]"
+            >
+              <img
+                v-if="item.thumbnail_url && !player.lowRamNoImages"
+                :src="item.thumbnail_url"
+                :alt="item.title"
+                loading="lazy"
+                decoding="async"
+                class="w-full h-full object-cover"
+              />
+            </div>
+
+            <div class="min-w-0">
+              <p class="text-xs font-semibold text-[#1A162B] dark:text-[#F4F2FA] truncate">
+                {{ item.title }}
+              </p>
+              <p class="text-[11px] text-[#6E6885] dark:text-[#9B94B2] truncate">
+                {{ item.artist }}
+              </p>
+            </div>
+          </div>
+
+          <div class="flex items-center gap-1.5 shrink-0">
+            <span class="text-[11px] text-[#6E6885] dark:text-[#9B94B2] tabular-nums">
+              {{ item.duration_text }}
+            </span>
+            <button
+              type="button"
+              @click.stop="player.addToQueue(item)"
+              title="Adicionar à fila"
+              class="p-1 rounded-full text-[#6E6885] dark:text-[#9B94B2] hover:text-[#7C5CFC] dark:hover:text-[#B497FF] hover:bg-black/5 dark:hover:bg-white/10 transition-colors"
+            >
+              <Plus class="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      </div>
+    </template>
   </aside>
 </template>

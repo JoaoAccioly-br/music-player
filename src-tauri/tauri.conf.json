@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' asset: http://asset.localhost https://*.ytimg.com https://*.ggpht.com https://*.googleusercontent.com https://www.gstatic.com data: blob:; connect-src 'self' ipc: http://ipc.localhost https://music.youtube.com https://*.youtube.com https://lrclib.net; media-src 'self' blob: data:"
     }
   },
   "bundle": {
