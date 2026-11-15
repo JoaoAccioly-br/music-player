@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { computed, ref, watch } from 'vue'
+import { computed, ref, shallowRef, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
@@ -40,11 +40,24 @@ export interface AuthStatus {
   updated_at: number
 }
 
+export interface TimedLyricLine {
+  timeSecs: number | null
+  text: string
+}
+
 export interface LyricsData {
   videoId: string
   hasLyrics: boolean
+  isSynced: boolean
   lines: string[]
+  timedLines: TimedLyricLine[]
   sourceLabel: string
+}
+
+interface RawTimedLyricLine {
+  time_secs?: number | null
+  timeSecs?: number | null
+  text?: string
 }
 
 interface RawLyricsResponse {
@@ -52,7 +65,11 @@ interface RawLyricsResponse {
   videoId?: string
   has_lyrics?: boolean
   hasLyrics?: boolean
+  is_synced?: boolean
+  isSynced?: boolean
   lines?: string[]
+  timed_lines?: RawTimedLyricLine[]
+  timedLines?: RawTimedLyricLine[]
   source_label?: string
   sourceLabel?: string
 }
@@ -102,6 +119,49 @@ export function formatTime(seconds: number): string {
   const mins = Math.floor(totalSecs / 60)
   const secs = totalSecs % 60
   return `${mins}:${secs.toString().padStart(2, '0')}`
+}
+
+export function computeActiveLyricIndex(
+  lyrics: LyricsData | null,
+  positionSecs: number,
+  durationSecs: number
+): number {
+  const timed = lyrics?.timedLines ?? []
+  if (!timed.length) return -1
+
+  if (lyrics?.isSynced) {
+    // Small lookahead (0.2s) compensates for ticker/IPC latency so verses highlight on beat
+    const adjustedPos = Math.max(0, positionSecs) + 0.2
+    let activeIdx = -1
+    for (let i = 0; i < timed.length; i++) {
+      const ts = timed[i].timeSecs
+      if (ts !== null && ts <= adjustedPos) {
+        activeIdx = i
+      } else if (ts !== null && ts > adjustedPos) {
+        break
+      }
+    }
+    return activeIdx
+  }
+
+  const dur = Math.max(1, durationSecs || 200)
+  const ratio = Math.min(0.99, Math.max(0, positionSecs / dur))
+  return Math.floor(ratio * timed.length)
+}
+
+export function getLyricLineSeekSecs(
+  lyrics: LyricsData | null,
+  lineIdx: number,
+  durationSecs: number
+): number {
+  const timed = lyrics?.timedLines ?? []
+  if (!timed.length || lineIdx < 0 || lineIdx >= timed.length) return 0
+  const ts = timed[lineIdx].timeSecs
+  if (lyrics?.isSynced && ts !== null) {
+    return Math.max(0, ts)
+  }
+  const dur = Math.max(1, durationSecs || 200)
+  return (lineIdx / timed.length) * dur
 }
 
 const FALLBACK_HOME_SECTIONS: HomeSection[] = [
@@ -238,8 +298,8 @@ const FALLBACK_PLAYLISTS: PlaylistItem[] = [
   },
 ]
 
-function buildFallbackLyrics(title: string, artist: string): string[] {
-  return [
+function buildFallbackLyrics(title: string, artist: string): TimedLyricLine[] {
+  const texts = [
     `♪ ${title} — ${artist}`,
     'Linha anterior da letra',
     'Mais uma linha já cantada',
@@ -249,6 +309,10 @@ function buildFallbackLyrics(title: string, artist: string): string[] {
     'Rolando junto com a música',
     'Até o fim da faixa',
   ]
+  return texts.map((text, idx) => ({
+    timeSecs: idx * 6,
+    text,
+  }))
 }
 
 export const usePlayerStore = defineStore('player', () => {
@@ -311,7 +375,7 @@ export const usePlayerStore = defineStore('player', () => {
   const lastSyncTimestamp = ref<string>('')
 
   // Right Panel, Fullscreen & Search Filter State
-  const queue = ref<TrackItem[]>([...FALLBACK_HOME_SECTIONS[0].items])
+  const queue = shallowRef<TrackItem[]>([...FALLBACK_HOME_SECTIONS[0].items])
   const rightPanelOpen = ref(false)
   const rightPanelTab = ref<RightPanelTab>('queue')
   const isFullscreenPlayer = ref(false)
@@ -328,7 +392,7 @@ export const usePlayerStore = defineStore('player', () => {
   // Lyrics & Related Tracks State
   const lyrics = ref<LyricsData | null>(null)
   const isLoadingLyrics = ref(false)
-  const relatedTracks = ref<TrackItem[]>([...FALLBACK_HOME_SECTIONS[0].items.slice(1)])
+  const relatedTracks = shallowRef<TrackItem[]>([...FALLBACK_HOME_SECTIONS[0].items.slice(1)])
   const isLoadingRelated = ref(false)
 
   // Auth & Innertube Catalog State
@@ -341,11 +405,11 @@ export const usePlayerStore = defineStore('player', () => {
     updated_at: 0,
   })
   const authError = ref<string | null>(null)
-  const homeSections = ref<HomeSection[]>([...FALLBACK_HOME_SECTIONS])
-  const searchResults = ref<TrackItem[]>([])
-  const likedTracks = ref<TrackItem[]>([...FALLBACK_HOME_SECTIONS[0].items])
-  const userPlaylists = ref<PlaylistItem[]>([...FALLBACK_PLAYLISTS])
-  const selectedPlaylistTracks = ref<TrackItem[]>([])
+  const homeSections = shallowRef<HomeSection[]>([...FALLBACK_HOME_SECTIONS])
+  const searchResults = shallowRef<TrackItem[]>([])
+  const likedTracks = shallowRef<TrackItem[]>([...FALLBACK_HOME_SECTIONS[0].items])
+  const userPlaylists = shallowRef<PlaylistItem[]>([...FALLBACK_PLAYLISTS])
+  const selectedPlaylistTracks = shallowRef<TrackItem[]>([])
   const selectedPlaylistTitle = ref<string>('')
   const isFetchingContent = ref(false)
 
@@ -373,15 +437,11 @@ export const usePlayerStore = defineStore('player', () => {
     autoplayRadio.value = state.autoplay_radio ?? true
     lowRamNoImages.value = state.low_ram_no_images ?? false
     errorMessage.value = state.error_message
-    lastSyncTimestamp.value = new Date().toLocaleTimeString()
 
     if (state.video_id && state.video_id !== previousVideoId) {
-      if (rightPanelTab.value === 'lyrics' || isFullscreenPlayer.value) {
-        fetchLyrics(state.video_id, state.current_track_title, state.current_track_artist)
-      } else {
+      if (rightPanelTab.value !== 'lyrics' && !isFullscreenPlayer.value) {
         lyrics.value = null
       }
-      refreshRelatedTracks()
     }
   }
 
@@ -458,31 +518,79 @@ export const usePlayerStore = defineStore('player', () => {
           title: targetTitle || null,
           artist: targetArtist || null,
         })
+        const rawTimed = Array.isArray(raw.timedLines)
+          ? raw.timedLines
+          : Array.isArray(raw.timed_lines)
+            ? raw.timed_lines
+            : []
         const resolvedLines = Array.isArray(raw.lines) && raw.lines.length > 0 ? raw.lines : []
-        const hasLyrics = Boolean(raw.hasLyrics ?? raw.has_lyrics) && resolvedLines.length > 0
+
+        let timedLines: TimedLyricLine[] = rawTimed
+          .filter((item) => typeof item?.text === 'string' && item.text.trim().length > 0)
+          .map((item) => {
+            const ts = item.timeSecs ?? item.time_secs
+            return {
+              timeSecs: typeof ts === 'number' && Number.isFinite(ts) ? ts : null,
+              text: item.text!.trim(),
+            }
+          })
+
+        if (timedLines.length === 0 && resolvedLines.length > 0) {
+          timedLines = resolvedLines.map((text) => ({ timeSecs: null, text }))
+        }
+
+        const hasLyrics = Boolean(raw.hasLyrics ?? raw.has_lyrics) && timedLines.length > 0
+        const isSynced =
+          hasLyrics &&
+          Boolean(raw.isSynced ?? raw.is_synced) &&
+          timedLines.some((line) => line.timeSecs !== null)
+
         lyrics.value = {
           videoId: raw.videoId ?? raw.video_id ?? targetVideoId,
-          hasLyrics: true,
-          lines: hasLyrics ? resolvedLines : buildFallbackLyrics(targetTitle, targetArtist),
+          hasLyrics,
+          isSynced,
+          lines: hasLyrics ? timedLines.map((l) => l.text) : [],
+          timedLines: hasLyrics ? timedLines : [],
           sourceLabel:
             raw.sourceLabel ??
             raw.source_label ??
-            (hasLyrics ? 'Sincronizada com a música' : 'Letra estimada'),
+            (hasLyrics
+              ? isSynced
+                ? 'Sincronizada (LRCLIB)'
+                : 'Letra não sincronizada (estimada)'
+              : 'Letra indisponível para esta faixa'),
         }
       } else {
+        const previewTimed = buildFallbackLyrics(targetTitle, targetArtist)
         lyrics.value = {
           videoId: targetVideoId,
           hasLyrics: true,
-          lines: buildFallbackLyrics(targetTitle, targetArtist),
-          sourceLabel: 'Sincronizada com a música',
+          isSynced: true,
+          lines: previewTimed.map((l) => l.text),
+          timedLines: previewTimed,
+          sourceLabel: 'Prévia sincronizada (navegador)',
         }
       }
     } catch {
-      lyrics.value = {
-        videoId: targetVideoId,
-        hasLyrics: true,
-        lines: buildFallbackLyrics(targetTitle, targetArtist),
-        sourceLabel: 'Sincronizada com a música',
+      if (isTauriConnected.value) {
+        lyrics.value = {
+          videoId: targetVideoId,
+          hasLyrics: false,
+          isSynced: false,
+          lines: [],
+          timedLines: [],
+          sourceLabel: 'Não foi possível carregar a letra',
+        }
+      } else {
+        const previewTimed = buildFallbackLyrics(targetTitle, targetArtist)
+        lyrics.value = {
+          videoId: targetVideoId,
+          hasLyrics: true,
+          isSynced: true,
+          lines: previewTimed.map((l) => l.text),
+          timedLines: previewTimed,
+          sourceLabel: 'Prévia sincronizada (navegador)',
+        }
       }
     } finally {
       isLoadingLyrics.value = false
@@ -535,7 +643,9 @@ export const usePlayerStore = defineStore('player', () => {
       queue.value = updated
       queueLen.value = updated.length
     } else if (queue.value.length > 1) {
-      queue.value.splice(index, 1)
+      const newQ = [...queue.value]
+      newQ.splice(index, 1)
+      queue.value = newQ
       if (index < queueIndex.value) {
         queueIndex.value = Math.max(0, queueIndex.value - 1)
       }
@@ -648,8 +758,10 @@ export const usePlayerStore = defineStore('player', () => {
     }
   }
 
+  const likedTrackIds = computed(() => new Set(likedTracks.value.map((t) => t.video_id)))
+
   function isTrackLiked(vid: string): boolean {
-    return likedTracks.value.some((t) => t.video_id === vid)
+    return likedTrackIds.value.has(vid)
   }
 
   function toggleLikeTrack(track?: TrackItem) {
@@ -662,17 +774,16 @@ export const usePlayerStore = defineStore('player', () => {
       duration_secs: durationSecs.value,
       thumbnail_url: currentThumbnailUrl.value,
     }
-    const existingIdx = likedTracks.value.findIndex((t) => t.video_id === target.video_id)
-    if (existingIdx >= 0) {
-      likedTracks.value.splice(existingIdx, 1)
+    if (likedTrackIds.value.has(target.video_id)) {
+      likedTracks.value = likedTracks.value.filter((t) => t.video_id !== target.video_id)
     } else {
-      likedTracks.value.unshift(target)
+      likedTracks.value = [target, ...likedTracks.value]
     }
   }
 
   async function addToQueue(track: TrackItem) {
     if (queue.value.some((t) => t.video_id === track.video_id)) return
-    queue.value.push(track)
+    queue.value = [...queue.value, track]
     queueLen.value = queue.value.length
   }
 

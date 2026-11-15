@@ -45,14 +45,26 @@ const repeatLabel = computed(() => {
   return 'Repetição Desativada'
 })
 
+let volumeDebounceTimer: ReturnType<typeof setTimeout> | null = null
 function handleVolumeInput(event: Event) {
   const target = event.target as HTMLInputElement
-  player.setVolume(parseFloat(target.value))
+  const val = parseFloat(target.value)
+  player.volume = val
+  if (volumeDebounceTimer) clearTimeout(volumeDebounceTimer)
+  volumeDebounceTimer = setTimeout(() => {
+    player.setVolume(val)
+  }, 40)
 }
 
+let seekDebounceTimer: ReturnType<typeof setTimeout> | null = null
 function handleSeekInput(event: Event) {
   const target = event.target as HTMLInputElement
-  player.seekTo(parseFloat(target.value))
+  const val = parseFloat(target.value)
+  player.positionSecs = val
+  if (seekDebounceTimer) clearTimeout(seekDebounceTimer)
+  seekDebounceTimer = setTimeout(() => {
+    player.seekTo(val)
+  }, 40)
 }
 
 function toggleMute() {

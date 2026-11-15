@@ -18,6 +18,7 @@ use innertube::{
 };
 use persistence::{load_persisted_session, save_persisted_session, PersistedSession};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -456,11 +457,10 @@ fn spawn_prefetch_next_track(app: AppHandle) {
                         }
 
                         let old_len = q_guard.len();
+                        let mut existing_ids: HashSet<String> =
+                            q_guard.iter().map(|t| t.video_id.clone()).collect();
                         for track in radio_tracks {
-                            if !q_guard
-                                .iter()
-                                .any(|existing| existing.video_id == track.video_id)
-                            {
+                            if existing_ids.insert(track.video_id.clone()) {
                                 q_guard.push(track);
                             }
                         }
@@ -726,11 +726,10 @@ fn spawn_radio_continuation(app: AppHandle, seed_video_id: String) {
         {
             if let Ok(mut q_guard) = container.queue.lock() {
                 let first_new_index = q_guard.len();
+                let mut existing_ids: HashSet<String> =
+                    q_guard.iter().map(|t| t.video_id.clone()).collect();
                 for track in radio_tracks {
-                    if !q_guard
-                        .iter()
-                        .any(|existing| existing.video_id == track.video_id)
-                    {
+                    if existing_ids.insert(track.video_id.clone()) {
                         q_guard.push(track);
                     }
                 }
@@ -770,17 +769,17 @@ fn spawn_radio_continuation(app: AppHandle, seed_video_id: String) {
     });
 }
 
-/// Starts a lightweight background thread that ticks every 500ms to synchronize real hardware
+/// Starts a lightweight background thread that ticks every 250ms to synchronize real hardware
 /// `rodio::Sink` telemetry (`get_position_secs()`, `is_track_finished()`) and progressive buffer
 /// growth (`active_buffer`), automatically handling RepeatOne, RepeatAll, Queue Advance, or
 /// Infinite Radio Autoplay (`/youtubei/v1/next`) when a song finishes.
-/// Avoids DBus / System Tray spam on normal 500ms ticks and suppresses IPC emission when the
+/// Avoids DBus / System Tray spam on normal 250ms ticks and suppresses IPC emission when the
 /// main WebView window is destroyed in Zero-WebView background mode!
 fn start_progress_ticker(app: AppHandle) {
     std::thread::Builder::new()
         .name("ytm-progress-ticker".to_string())
         .spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(Duration::from_millis(250));
 
             let Some(container) = app.try_state::<AppContainer>() else {
                 continue;
@@ -792,19 +791,13 @@ fn start_progress_ticker(app: AppHandle) {
             let mut track_transitioned = false;
 
             {
-                let queue_snapshot = container
-                    .queue
-                    .lock()
-                    .map(|q| q.clone())
-                    .unwrap_or_default();
-
                 if let Ok(mut state) = container.player.lock() {
                     if state.is_playing && !state.is_loading {
                         let real_pos = container.audio_engine.get_position_secs();
                         if real_pos > 0.0 {
                             state.position_secs = real_pos;
                         } else {
-                            state.position_secs += 0.5;
+                            state.position_secs += 0.25;
                         }
 
                         if let Ok(buf_guard) = container.active_buffer.lock() {
@@ -825,6 +818,11 @@ fn start_progress_ticker(app: AppHandle) {
                                 && state.position_secs >= state.duration_secs);
 
                         if track_finished {
+                            let queue_snapshot = container
+                                .queue
+                                .lock()
+                                .map(|q| q.clone())
+                                .unwrap_or_default();
                             let queue_len = queue_snapshot.len().max(1);
                             match state.repeat_mode {
                                 RepeatMode::One => {
@@ -909,6 +907,9 @@ fn start_progress_ticker(app: AppHandle) {
 /// Focuses the existing main window or recreates it from scratch if it was destroyed
 /// when the user closed it ('X') to free WebView RAM.
 pub fn show_or_recreate_main_window(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -1060,11 +1061,14 @@ fn play_track_list(
     tracks: Vec<TrackItem>,
     start_index: usize,
 ) -> PlayerState {
-    let active_queue = if tracks.is_empty() {
+    let mut active_queue = if tracks.is_empty() {
         default_queue_tracks()
     } else {
         tracks
     };
+    if active_queue.len() > 500 {
+        active_queue.truncate(500);
+    }
 
     if let Ok(mut q_guard) = container.queue.lock() {
         *q_guard = active_queue.clone();
@@ -1101,7 +1105,10 @@ fn set_volume(app: AppHandle, container: State<'_, AppContainer>, volume: f32) -
         state.clone()
     };
     broadcast_state_change(&app, &updated);
-    persist_current_session(&app);
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        persist_current_session(&app_clone);
+    });
     updated
 }
 
@@ -1610,6 +1617,7 @@ fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
             }
             "quit" => {
                 persist_current_session(app);
+                audio::clean_temp_cookie_files();
                 let container = app.state::<AppContainer>();
                 container.download_generation.fetch_add(1, Ordering::SeqCst);
                 container.prefetch_generation.fetch_add(1, Ordering::SeqCst);
@@ -1644,6 +1652,7 @@ pub fn run() {
         .manage(AppContainer::default())
         .setup(|app| {
             setup_system_tray(app.handle())?;
+            audio::clean_temp_cookie_files();
             start_progress_ticker(app.handle().clone());
             // Ensure yt-dlp binary is ready in background at startup
             tauri::async_runtime::spawn(async {
@@ -1687,8 +1696,8 @@ pub fn run() {
     // When the user closes the window ('X'), the WebView is completely destroyed to free RAM,
     // triggering RunEvent::ExitRequested when the last window closes. We prevent process exit
     // unless the user explicitly clicked "Sair Completamente" in the System Tray menu.
-    app.run(|app_handle, event| {
-        if let RunEvent::ExitRequested { api, .. } = event {
+    app.run(|app_handle, event| match event {
+        RunEvent::ExitRequested { api, .. } => {
             let quit_requested = app_handle
                 .try_state::<AppContainer>()
                 .map(|c| c.quit_requested.load(Ordering::SeqCst))
@@ -1696,8 +1705,20 @@ pub fn run() {
 
             if !quit_requested {
                 api.prevent_exit();
+                #[cfg(target_os = "macos")]
+                let _ = app_handle.set_activation_policy(tauri::ActivationPolicy::Accessory);
             }
         }
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen {
+            has_visible_windows,
+            ..
+        } => {
+            if !has_visible_windows {
+                show_or_recreate_main_window(app_handle);
+            }
+        }
+        _ => {}
     });
 }
 

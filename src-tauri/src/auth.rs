@@ -211,14 +211,9 @@ pub fn generate_sapisidhash(sapisid: &str, origin: &str) -> String {
     )
 }
 
-/// Resolves `~/.local/share/com.ytmusic.rust/auth.json`.
+/// Resolves `<app_data_dir>/auth.json`.
 pub fn get_auth_file_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("com.ytmusic.rust")
-        .join("auth.json")
+    crate::persistence::get_app_data_dir().join("auth.json")
 }
 
 /// Loads the persisted `AuthSession` from `~/.local/share/com.ytmusic.rust/auth.json` if present.
@@ -242,12 +237,12 @@ pub fn load_session_from_disk() -> AuthSession {
 }
 
 /// Persists `AuthSession` to `~/.local/share/com.ytmusic.rust/auth.json` with strict `0700` dir
-/// and `0600` file permissions on Unix so no other local user/process can read the session cookies.
+/// and `0600` file permissions on Unix without TOCTOU race conditions.
 pub fn save_session_to_disk(session: &AuthSession) -> Result<(), String> {
     let path = get_auth_file_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .map_err(|e| format!("Falha ao criar diretório de sessão {:?}: {e}", parent))?;
+            .map_err(|e| format!("Falha ao criar diretório de sessão: {e}"))?;
 
         #[cfg(unix)]
         {
@@ -256,17 +251,29 @@ pub fn save_session_to_disk(session: &AuthSession) -> Result<(), String> {
         }
     }
 
-    let serialized = serde_json::to_string_pretty(session)
-        .map_err(|e| format!("Falha ao serializar sessão: {e}"))?;
-
-    fs::write(&path, serialized)
-        .map_err(|e| format!("Falha ao gravar arquivo de sessão {:?}: {e}", path))?;
+    let serialized =
+        serde_json::to_string(session).map_err(|e| format!("Falha ao serializar sessão: {e}"))?;
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("Falha ao aplicar permissão 0600 em {:?}: {e}", path))?;
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("Falha ao abrir arquivo de sessão protegido: {e}"))?;
+        file.write_all(serialized.as_bytes())
+            .map_err(|e| format!("Falha ao gravar arquivo de sessão: {e}"))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(&path, serialized)
+            .map_err(|e| format!("Falha ao gravar arquivo de sessão: {e}"))?;
     }
 
     Ok(())
@@ -276,8 +283,7 @@ pub fn save_session_to_disk(session: &AuthSession) -> Result<(), String> {
 pub fn clear_session_on_disk() -> Result<(), String> {
     let path = get_auth_file_path();
     if path.exists() {
-        fs::remove_file(&path)
-            .map_err(|e| format!("Falha ao remover arquivo de sessão {:?}: {e}", path))?;
+        fs::remove_file(&path).map_err(|e| format!("Falha ao remover arquivo de sessão: {e}"))?;
     }
     Ok(())
 }
@@ -311,8 +317,19 @@ pub fn build_session_from_cookie_str(
 
 /// Opens a temporary secondary WebView window (`"google-login"`) pointing to Google Login -> YouTube Music.
 /// Uses a clean Firefox Linux Desktop User-Agent to avoid Google's embedded browser block on WebKitGTK,
-/// and starts a background cookie watcher that automatically captures `SAPISID`, saves `auth.json` (`0600`),
-/// and destroys the login WebView as soon as login completes to free 100% of its RAM!
+/// restricts navigation to verified Google / YouTube domains, and starts a background cookie watcher
+/// that automatically captures `SAPISID`, saves `auth.json` (`0600`), and destroys the login WebView
+/// as soon as login completes to free 100% of its RAM!
+/// Validates whether a URL belongs to the Google / YouTube login navigation allowlist.
+pub fn is_allowed_login_navigation_url(url: &tauri::Url) -> bool {
+    let host = url.host_str().unwrap_or("");
+    host == "accounts.google.com"
+        || host.ends_with(".google.com")
+        || host == "music.youtube.com"
+        || host == "accounts.youtube.com"
+        || host.ends_with(".youtube.com")
+}
+
 pub fn open_google_login_window(app: &AppHandle) -> Result<(), String> {
     if let Some(existing) = app.get_webview_window("google-login") {
         let _ = existing.show();
@@ -330,6 +347,7 @@ pub fn open_google_login_window(app: &AppHandle) -> Result<(), String> {
             .inner_size(520.0, 680.0)
             .resizable(true)
             .user_agent(FIREFOX_LINUX_UA)
+            .on_navigation(|url| is_allowed_login_navigation_url(url))
             .build()
             .map_err(|e| format!("Falha ao abrir janela de login Google: {e}"))?;
 
@@ -406,4 +424,180 @@ fn spawn_login_cookie_watcher(app: AppHandle) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_sapisid_from_cookie_formats() {
+        assert_eq!(extract_sapisid_from_cookie(""), None);
+        assert_eq!(extract_sapisid_from_cookie("   
+	  "), None);
+        assert_eq!(extract_sapisid_from_cookie("SID=abc; HSID=def"), None);
+        assert_eq!(extract_sapisid_from_cookie("shorttoken"), None);
+
+        // Standard Cookie header with prefix and quotes
+        let header = "Cookie: SID=xyz; SAPISID=\"AbCdEf123456/GhIj\"; PREF=1";
+        assert_eq!(
+            extract_sapisid_from_cookie(header),
+            Some("AbCdEf123456/GhIj".to_string())
+        );
+
+        // __Secure-3PAPISID takes priority over SAPISID
+        let priority_header = "cookie: SAPISID=fallback_token_123; __Secure-3PAPISID=preferred_3p_token; __Secure-1PAPISID=onep_token";
+        assert_eq!(
+            extract_sapisid_from_cookie(priority_header),
+            Some("preferred_3p_token".to_string())
+        );
+
+        // __Secure-1PAPISID fallback when SAPISID and __Secure-3PAPISID absent
+        let onep_header = "SID=xyz; __Secure-1PAPISID=only_1p_token_value";
+        assert_eq!(
+            extract_sapisid_from_cookie(onep_header),
+            Some("only_1p_token_value".to_string())
+        );
+
+        // Netscape cookies.txt format (ignoring comments & blank lines)
+        let netscape = "# Netscape HTTP Cookie File
+
+.youtube.com	TRUE	/	TRUE	2147483647	SID	sid_val
+.youtube.com	TRUE	/	TRUE	2147483647	SAPISID	netscape_sapisid_999
+";
+        assert_eq!(
+            extract_sapisid_from_cookie(netscape),
+            Some("netscape_sapisid_999".to_string())
+        );
+
+        // Raw SAPISID token directly pasted (>= 14 chars, no '=', ';', ' ')
+        assert_eq!(
+            extract_sapisid_from_cookie("AbCdEf123456/GhIjKlMn"),
+            Some("AbCdEf123456/GhIjKlMn".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_cookie_header_and_build_session() {
+        // Raw token expands into full cookie header
+        let normalized_raw = normalize_cookie_header("RawToken1234567890", "RawToken1234567890");
+        assert!(normalized_raw.contains("SAPISID=RawToken1234567890"));
+        assert!(normalized_raw.contains("__Secure-3PAPISID=RawToken1234567890"));
+        assert!(normalized_raw.contains("__Secure-1PAPISID=RawToken1234567890"));
+
+        // Standard header missing __Secure-3PAPISID gets it appended
+        let normalized_hdr = normalize_cookie_header("Cookie: SID=1; SAPISID=tok123456789012", "tok123456789012");
+        assert!(normalized_hdr.contains("SID=1"));
+        assert!(normalized_hdr.contains("SAPISID=tok123456789012"));
+        assert!(normalized_hdr.contains("__Secure-3PAPISID=tok123456789012"));
+
+        // Netscape format converts to `; `-separated HTTP Cookie header
+        let netscape = ".youtube.com	TRUE	/	TRUE	2147483647	SID	sid1
+.youtube.com	TRUE	/	TRUE	2147483647	SAPISID	net_tok_12345678";
+        let normalized_ns = normalize_cookie_header(netscape, "net_tok_12345678");
+        assert!(normalized_ns.contains("SID=sid1"));
+        assert!(normalized_ns.contains("SAPISID=net_tok_12345678"));
+        assert!(normalized_ns.contains("__Secure-3PAPISID=net_tok_12345678"));
+
+        // build_session_from_cookie_str
+        assert!(build_session_from_cookie_str("SID=only_no_sapisid", "manual").is_err());
+        let session = build_session_from_cookie_str("SAPISID=abcd1234efgh5678; SID=s1", "manual")
+            .expect("valid cookie should build AuthSession");
+        assert!(session.is_authenticated);
+        assert_eq!(session.sapisid, "abcd1234efgh5678");
+        assert_eq!(session.auth_method, "manual");
+
+        let status = session.to_status();
+        assert!(status.is_authenticated);
+        assert!(status.has_sapisid);
+        assert_eq!(status.sapisid_preview, "abcd...5678");
+        assert_eq!(status.account_hint, "SAPISID (abcd...5678)");
+    }
+
+    #[test]
+    fn test_auth_status_preview_for_short_and_empty_sapisid() {
+        let short_session = AuthSession {
+            is_authenticated: true,
+            cookie_header: "SAPISID=short12".to_string(),
+            sapisid: "short12".to_string(),
+            auth_method: "manual".to_string(),
+            updated_at: 100,
+        };
+        let status = short_session.to_status();
+        assert_eq!(status.sapisid_preview, "***");
+        assert_eq!(status.account_hint, "SAPISID (***)");
+
+        let empty_status = AuthSession::default().to_status();
+        assert!(!empty_status.is_authenticated);
+        assert!(!empty_status.has_sapisid);
+        assert_eq!(empty_status.sapisid_preview, "");
+        assert_eq!(empty_status.account_hint, "Não conectado");
+    }
+
+    #[test]
+    fn test_generate_sapisidhash_format_and_sha1_digest() {
+        let sapisid = "TestSapisidToken/12345";
+        let header = generate_sapisidhash(sapisid, YTM_ORIGIN);
+        let parts: Vec<&str> = header.split(' ').collect();
+        assert_eq!(parts.len(), 6, "Expected 3 scheme-value pairs: {header}");
+        assert_eq!(parts[0], "SAPISIDHASH");
+        assert_eq!(parts[2], "SAPISID1PHASH");
+        assert_eq!(parts[4], "SAPISID3PHASH");
+        assert_eq!(parts[1], parts[3]);
+        assert_eq!(parts[1], parts[5]);
+
+        let (ts_str, hex_hash) = parts[1]
+            .split_once('_')
+            .expect("hash value must contain '<ts>_<sha1>'");
+        let _ts: u64 = ts_str.parse().expect("timestamp must be a valid u64");
+        assert_eq!(hex_hash.len(), 40);
+        assert!(hex_hash.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
+
+        // Independently verify SHA-1 digest matches RFC input "<ts> <sapisid> <origin>"
+        let expected_input = format!("{ts_str} {sapisid} {YTM_ORIGIN}");
+        let mut hasher = Sha1::new();
+        hasher.update(expected_input.as_bytes());
+        let expected_hex: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(hex_hash, expected_hex);
+    }
+
+    #[test]
+    fn test_is_allowed_login_navigation_url_allowlist() {
+        let allowed = [
+            "https://accounts.google.com/ServiceLogin?service=youtube",
+            "https://myaccount.google.com/security",
+            "https://music.youtube.com/",
+            "https://accounts.youtube.com/RotateCookies",
+            "https://www.youtube.com/signin",
+        ];
+        for raw in allowed {
+            let url: tauri::Url = raw.parse().unwrap();
+            assert!(
+                is_allowed_login_navigation_url(&url),
+                "Expected URL to be allowed: {raw}"
+            );
+        }
+
+        let blocked = [
+            "https://evil.com/login",
+            "https://google.com.evil.com/",
+            "https://youtube.com.attacker.org/",
+            "https://notgoogle.com/",
+            "https://accounts.google.com.phish.io/",
+            "about:blank",
+            "data:text/html,<h1>phish</h1>",
+            "file:///etc/passwd",
+        ];
+        for raw in blocked {
+            let url: tauri::Url = raw.parse().unwrap();
+            assert!(
+                !is_allowed_login_navigation_url(&url),
+                "Expected URL to be blocked: {raw}"
+            );
+        }
+    }
 }

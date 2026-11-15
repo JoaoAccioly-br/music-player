@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   ChevronDown,
   ChevronRight,
@@ -29,7 +29,9 @@ import QueueDrawer from './components/QueueDrawer.vue'
 import PlayerBar from './components/PlayerBar.vue'
 import AuthModal from './components/AuthModal.vue'
 import {
+  computeActiveLyricIndex,
   formatTime,
+  getLyricLineSeekSecs,
   getPastelGradient,
   usePlayerStore,
   type PlaylistItem,
@@ -208,18 +210,39 @@ const searchArtists = computed<Array<{ name: string; gradient: string }>>(() => 
   }))
 })
 
-const activeLyricIndex = computed(() => {
-  const lines = player.lyrics?.lines ?? []
-  if (!lines.length) return 0
-  const dur = Math.max(1, player.durationSecs || 200)
-  const ratio = Math.min(0.99, Math.max(0, player.positionSecs / dur))
-  return Math.floor(ratio * lines.length)
+const activeLyricIndex = computed(() =>
+  computeActiveLyricIndex(player.lyrics, player.positionSecs, player.durationSecs)
+)
+
+const lyricLineEls = new Map<number, HTMLElement>()
+function setLyricLineRef(el: unknown, idx: number) {
+  if (el instanceof HTMLElement) {
+    lyricLineEls.set(idx, el)
+  } else {
+    lyricLineEls.delete(idx)
+  }
+}
+
+async function scrollActiveLyricIntoView(idx: number) {
+  if (idx < 0 || !showLyricsMainView.value) return
+  await nextTick()
+  lyricLineEls.get(idx)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
+watch(activeLyricIndex, (idx) => {
+  scrollActiveLyricIntoView(idx)
+})
+
+watch(showLyricsMainView, (visible) => {
+  if (visible && activeLyricIndex.value >= 0) {
+    scrollActiveLyricIntoView(activeLyricIndex.value)
+  }
 })
 
 function seekToLyricLine(lineIdx: number) {
-  const lines = player.lyrics?.lines ?? []
-  if (!lines.length) return
-  const targetSec = (lineIdx / lines.length) * (player.durationSecs || 200)
+  const timed = player.lyrics?.timedLines ?? []
+  if (!timed.length) return
+  const targetSec = getLyricLineSeekSecs(player.lyrics, lineIdx, player.durationSecs)
   player.seekTo(targetSec)
 }
 
@@ -316,7 +339,6 @@ function handleOpenLyricsView() {
   showLyricsMainView.value = !showLyricsMainView.value
   if (showLyricsMainView.value) {
     player.setRightPanelTab('lyrics')
-    player.fetchLyrics()
   }
 }
 
@@ -469,8 +491,15 @@ onUnmounted(() => {
                       </button>
                     </div>
 
-                    <span class="text-xs text-[#6E6885] dark:text-[#9B94B2]">
-                      {{ player.lyrics?.sourceLabel || 'Sincronizada com a música' }}
+                    <span
+                      :class="[
+                        'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium',
+                        player.lyrics?.isSynced
+                          ? 'bg-[#22C55E]/15 text-[#15803D] dark:text-[#4ADE80]'
+                          : 'bg-[#EDE9F5] dark:bg-[#1E1A2D] text-[#6E6885] dark:text-[#9B94B2]',
+                      ]"
+                    >
+                      {{ player.lyrics?.sourceLabel || 'Buscando letra...' }}
                     </span>
                   </div>
 
@@ -482,13 +511,21 @@ onUnmounted(() => {
                     <span class="text-sm">Carregando letra sincronizada...</span>
                   </div>
 
+                  <div
+                    v-else-if="!(player.lyrics?.timedLines?.length)"
+                    class="py-16 text-sm text-[#6E6885] dark:text-[#9B94B2]"
+                  >
+                    {{ player.lyrics?.sourceLabel || 'Letra indisponível para esta faixa.' }}
+                  </div>
+
                   <div v-else class="space-y-4 py-2 max-h-[60vh] overflow-y-auto pr-2">
                     <p
-                      v-for="(line, idx) in player.lyrics?.lines || []"
+                      v-for="(line, idx) in player.lyrics?.timedLines || []"
                       :key="idx"
+                      :ref="(el) => setLyricLineRef(el, idx)"
                       @click="seekToLyricLine(idx)"
                       :class="[
-                        'cursor-pointer transition-all duration-300 leading-snug',
+                        'group flex items-baseline gap-3 cursor-pointer transition-all duration-300 leading-snug',
                         idx === activeLyricIndex
                           ? 'text-xl sm:text-2xl font-bold text-[#1A162B] dark:text-[#F4F2FA]'
                           : idx === activeLyricIndex + 1
@@ -498,7 +535,13 @@ onUnmounted(() => {
                               : 'text-sm sm:text-base font-medium text-[#6E6885]/65 dark:text-[#9B94B2]/55 hover:text-[#1A162B] dark:hover:text-white',
                       ]"
                     >
-                      {{ line }}
+                      <span
+                        v-if="line.timeSecs !== null"
+                        class="text-[11px] font-normal tabular-nums text-[#6E6885]/60 dark:text-[#9B94B2]/50 opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
+                      >
+                        {{ formatTime(line.timeSecs) }}
+                      </span>
+                      <span>{{ line.text }}</span>
                     </p>
                   </div>
                 </div>

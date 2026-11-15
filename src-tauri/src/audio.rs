@@ -15,6 +15,61 @@ use tokio::process::Command;
 
 pub const YT_DLP_LINUX_URL: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux";
+pub const YT_DLP_LINUX_AARCH64_URL: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64";
+pub const YT_DLP_WINDOWS_URL: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+pub const YT_DLP_MACOS_URL: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos";
+
+/// Returns the official yt-dlp standalone release URL for the current OS and architecture.
+pub fn get_yt_dlp_download_url() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        YT_DLP_WINDOWS_URL
+    }
+    #[cfg(target_os = "macos")]
+    {
+        YT_DLP_MACOS_URL
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos"), target_arch = "aarch64"))]
+    {
+        YT_DLP_LINUX_AARCH64_URL
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos"), not(target_arch = "aarch64")))]
+    {
+        YT_DLP_LINUX_URL
+    }
+}
+
+/// Returns the yt-dlp executable filename for the current OS.
+pub fn get_yt_dlp_binary_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "yt-dlp.exe"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "yt-dlp"
+    }
+}
+
+/// Validates redirect targets when downloading the official yt-dlp release from GitHub.
+fn is_trusted_yt_dlp_download_url(url: &reqwest::Url) -> bool {
+    if url.scheme() != "https" {
+        return false;
+    }
+    match url.host_str() {
+        Some(host) => {
+            host == "github.com"
+                || host.ends_with(".github.com")
+                || host == "objects.githubusercontent.com"
+                || host == "release-assets.githubusercontent.com"
+                || host == "github-releases.githubusercontent.com"
+        }
+        None => false,
+    }
+}
 
 static COOKIE_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static YT_DLP_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -194,13 +249,14 @@ impl ProgressiveAudioBuffer {
     }
 
     /// Appends a chunk of bytes and wakes up any waiting `ProgressiveReader` threads.
+    /// Fast-path: Only scans for DASH MP4 `sidx` box in the initial 64 KB header.
     pub fn push_chunk(&self, chunk: &[u8]) {
         if chunk.is_empty() {
             return;
         }
         if let Ok(mut guard) = self.shared.state.lock() {
             guard.data.extend_from_slice(chunk);
-            if guard.total_expected.is_none() {
+            if guard.total_expected.is_none() && guard.data.len() <= 65_536 {
                 if let Some((exact_bytes, _)) = parse_mp4_sidx_metadata(&guard.data) {
                     guard.total_expected = Some(exact_bytes.min(25 * 1024 * 1024));
                 }
@@ -441,9 +497,6 @@ impl AudioTelemetry {
 }
 
 /// Commands sent from Tauri IPC / System Tray threads to the dedicated native audio thread.
-/// Because `rodio::OutputStream` contains raw OS audio device handles (ALSA/PipeWire) that are
-/// `!Send` and `!Sync`, keeping `OutputStream` and `Sink` inside a dedicated OS thread and
-/// communicating via an `mpsc::Sender<AudioCommand>` is the idiomatic, zero-overhead Rust pattern.
 pub enum AudioCommand {
     LoadAndPlay {
         data: ProgressiveAudioBuffer,
@@ -476,8 +529,6 @@ impl AudioEngine {
         thread::Builder::new()
             .name("ytm-native-audio".to_string())
             .spawn(move || {
-                // Attempt to open the default OS audio output device (ALSA / PulseAudio / PipeWire).
-                // `_stream` MUST stay alive on this thread for `Sink` to output sound.
                 let mut stream_opt = OutputStream::try_default().ok();
                 let mut sink_opt: Option<Sink> = None;
                 let mut current_buffer: Option<ProgressiveAudioBuffer> = None;
@@ -488,7 +539,6 @@ impl AudioEngine {
                 loop {
                     match rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(cmd) => {
-                            // Lazily retry opening the audio device if it wasn't available at startup.
                             if stream_opt.is_none() {
                                 stream_opt = OutputStream::try_default().ok();
                             }
@@ -499,7 +549,6 @@ impl AudioEngine {
                                     is_paused = false;
                                     seek_offset_secs = 0.0;
 
-                                    // Drop previous sink immediately to stop playback and free decoder memory.
                                     if let Some(old_sink) = sink_opt.take() {
                                         old_sink.stop();
                                     }
@@ -552,7 +601,6 @@ impl AudioEngine {
                                         }
                                     }
 
-                                    // Fallback if the sink had already finished or decoder required re-seeking from RAM buffer
                                     if !seek_succeeded {
                                         if let (Some((_, ref stream_handle)), Some(ref buffer)) =
                                             (&stream_opt, &current_buffer)
@@ -612,7 +660,6 @@ impl AudioEngine {
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
 
-                    // Update real-time atomic telemetry from active `rodio::Sink`
                     if let Some(ref sink) = sink_opt {
                         let pos_secs = seek_offset_secs + sink.get_pos().as_secs_f64();
                         thread_telemetry
@@ -643,13 +690,10 @@ impl AudioEngine {
         }
     }
 
-    /// Returns the real hardware playback position in seconds from `AudioTelemetry`.
     pub fn get_position_secs(&self) -> f64 {
         self.telemetry.position_seconds()
     }
 
-    /// Returns `true` when an active track is loaded, the progressive buffer has finished
-    /// downloading, playback is not paused, and the `rodio::Sink` has drained all samples.
     pub fn is_track_finished(&self) -> bool {
         self.telemetry.has_active_track.load(Ordering::Relaxed)
             && self.telemetry.is_sink_empty.load(Ordering::Relaxed)
@@ -666,15 +710,29 @@ pub struct ExtractedAudio {
     pub author: Option<String>,
 }
 
-/// Resolves `~/.local/share/com.ytmusic.rust/bin/yt-dlp`.
+/// Resolves `<app_data_dir>/bin/yt-dlp` (or `yt-dlp.exe` on Windows).
 pub fn get_yt_dlp_bin_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("com.ytmusic.rust")
+    crate::persistence::get_app_data_dir()
         .join("bin")
-        .join("yt-dlp")
+        .join(get_yt_dlp_binary_name())
+}
+
+/// Resolves `<app_data_dir>` for temporary Netscape cookie files.
+pub fn get_temp_cookie_dir() -> PathBuf {
+    crate::persistence::get_app_data_dir()
+}
+
+/// Sweeps and removes any orphaned temporary cookie files left behind by interrupted sessions.
+pub fn clean_temp_cookie_files() {
+    let dir = get_temp_cookie_dir();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with("cookies.") && file_name.ends_with(".tmp.txt") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 /// Ensures the standalone `yt-dlp` binary exists at `~/.local/share/com.ytmusic.rust/bin/yt-dlp`.
@@ -701,16 +759,28 @@ pub async fn ensure_yt_dlp_binary() -> Result<PathBuf, String> {
 
     if let Some(parent) = bin_path.parent() {
         fs::create_dir_all(parent)
-            .map_err(|e| format!("Falha ao criar diretório para yt-dlp ({:?}): {e}", parent))?;
+            .map_err(|e| format!("Falha ao criar diretório para yt-dlp: {e}"))?;
     }
 
+    let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("Muitos redirecionamentos ao baixar yt-dlp");
+        }
+        if is_trusted_yt_dlp_download_url(attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.error("Redirecionamento não confiável ao baixar yt-dlp")
+        }
+    });
+
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(60))
+        .redirect(redirect_policy)
         .build()
-        .map_err(|e| format!("Falha ao iniciar cliente HTTP para baixar yt-dlp: {e}"))?;
+        .map_err(|e| format!("Falha ao inicializar cliente HTTP para yt-dlp: {e}"))?;
 
     let resp = client
-        .get(YT_DLP_LINUX_URL)
+        .get(get_yt_dlp_download_url())
         .header("User-Agent", FIREFOX_LINUX_UA)
         .send()
         .await
@@ -728,19 +798,35 @@ pub async fn ensure_yt_dlp_binary() -> Result<PathBuf, String> {
         .await
         .map_err(|e| format!("Erro ao ler bytes do binário yt-dlp: {e}"))?;
 
-    let tmp_path = bin_path.with_extension("part");
-    fs::write(&tmp_path, &bytes)
-        .map_err(|e| format!("Falha ao salvar yt-dlp temporário ({:?}): {e}", tmp_path))?;
+    if bytes.len() < 1_000_000 {
+        return Err("Binário yt-dlp corrompido ou incompleto baixado do GitHub".to_string());
+    }
+
+    let tmp_path = PathBuf::from(format!("{}.part", bin_path.display()));
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("Falha ao aplicar chmod 0755 no yt-dlp: {e}"))?;
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o755)
+            .open(&tmp_path)
+            .map_err(|e| format!("Falha ao criar arquivo temporário do yt-dlp: {e}"))?;
+        file.write_all(&bytes)
+            .map_err(|e| format!("Falha ao gravar bytes do yt-dlp: {e}"))?;
     }
 
-    fs::rename(&tmp_path, &bin_path)
-        .map_err(|e| format!("Falha ao mover yt-dlp para {:?}: {e}", bin_path))?;
+    #[cfg(not(unix))]
+    {
+        fs::write(&tmp_path, &bytes)
+            .map_err(|e| format!("Falha ao salvar yt-dlp temporário: {e}"))?;
+    }
+
+    fs::rename(&tmp_path, &bin_path).map_err(|e| format!("Falha ao mover yt-dlp: {e}"))?;
 
     Ok(bin_path)
 }
@@ -749,7 +835,7 @@ pub async fn ensure_yt_dlp_binary() -> Result<PathBuf, String> {
 pub fn parse_youtube_video_id(input: &str) -> String {
     let trimmed = input.trim();
 
-    // Check query parameter ?v= or &v=
+    // Check standard ?v=<id> parameter
     if let Some(pos) = trimmed.find("v=") {
         let after_v = &trimmed[pos + 2..];
         let id: String = after_v
@@ -791,7 +877,7 @@ pub fn parse_youtube_video_id(input: &str) -> String {
 
 /// Writes an authenticated Netscape `cookies.txt` file with strict `0600` permissions if needed by `yt-dlp`.
 /// Uses a unique filename per invocation so concurrent active downloads and background prefetches never race.
-fn write_temp_netscape_cookies(session: &AuthSession) -> Option<PathBuf> {
+pub fn write_temp_netscape_cookies(session: &AuthSession) -> Option<PathBuf> {
     if !session.is_authenticated || session.cookie_header.trim().is_empty() {
         return None;
     }
@@ -803,15 +889,16 @@ fn write_temp_netscape_cookies(session: &AuthSession) -> Option<PathBuf> {
         .unwrap_or(0);
     let pid = std::process::id();
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let cookies_path = PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("com.ytmusic.rust")
-        .join(format!("cookies.{pid}.{nanos}.{seq}.tmp.txt"));
+    let parent_dir = get_temp_cookie_dir();
+    let cookies_path = parent_dir.join(format!("cookies.{pid}.{nanos}.{seq}.tmp.txt"));
 
-    if let Some(parent) = cookies_path.parent() {
-        let _ = fs::create_dir_all(parent);
+    if fs::create_dir_all(&parent_dir).is_err() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&parent_dir, fs::Permissions::from_mode(0o700));
     }
 
     let mut lines = vec![
@@ -819,11 +906,12 @@ fn write_temp_netscape_cookies(session: &AuthSession) -> Option<PathBuf> {
         "# Generated in-app by youtube-music-rust".to_string(),
     ];
 
-    for pair in session.cookie_header.split(';') {
+    let sanitized_header = session.cookie_header.replace('\r', "").replace('\n', "");
+    for pair in sanitized_header.split(';') {
         let trimmed = pair.trim();
         if let Some((k, v)) = trimmed.split_once('=') {
-            let name = k.trim();
-            let val = v.trim();
+            let name = k.trim().replace('\t', "");
+            let val = v.trim().replace('\t', "");
             if !name.is_empty() && !val.is_empty() {
                 lines.push(format!(
                     ".youtube.com\tTRUE\t/\tTRUE\t2147483647\t{name}\t{val}"
@@ -832,15 +920,34 @@ fn write_temp_netscape_cookies(session: &AuthSession) -> Option<PathBuf> {
         }
     }
 
-    if fs::write(&cookies_path, lines.join("\n")).is_ok() {
-        #[cfg(unix)]
+    let content = lines.join("\n");
+
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut f) = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&cookies_path)
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&cookies_path, fs::Permissions::from_mode(0o600));
+            if f.write_all(content.as_bytes()).is_ok() {
+                return Some(cookies_path);
+            }
         }
-        Some(cookies_path)
-    } else {
         None
+    }
+
+    #[cfg(not(unix))]
+    {
+        if fs::write(&cookies_path, content).is_ok() {
+            Some(cookies_path)
+        } else {
+            None
+        }
     }
 }
 
@@ -849,7 +956,7 @@ fn write_temp_netscape_cookies(session: &AuthSession) -> Option<PathBuf> {
 ///    `m4a` (`itag 140` / `bestaudio[ext=m4a]`) bytes directly to `stdout` into a progressive RAM
 ///    `ProgressiveAudioBuffer`. As soon as the initial 256 KB header (`ftyp` + `moov` + `sidx` + first
 ///    `moof`/`mdat` audio frames) is buffered and verified by `rodio::Decoder`, returns immediately
-///    while a background thread continues feeding the remaining chunks!
+///    while a background task continues feeding the remaining chunks!
 ///    Supports immediate cancellation via `generation_pair` (`kill_on_drop(true)`) so switching
 ///    songs quickly kills the old `yt-dlp` process right away.
 /// 2. Falls back to direct Innertube `/youtubei/v1/player` extraction if `yt-dlp` is unavailable.
@@ -889,34 +996,33 @@ async fn try_fetch_yt_dlp_audio(
 ) -> Result<ExtractedAudio, String> {
     let bin_path = ensure_yt_dlp_binary().await?;
 
-    // First attempt unauthenticated (fastest & avoids account rate-limits on public music videos)
-    match run_yt_dlp_stdout_stream(&bin_path, video_id, None, generation_pair.clone()).await {
-        Ok(audio) => return Ok(audio),
-        Err(e) if e == "Download cancelado (nova música selecionada)" => return Err(e),
-        Err(unauth_err) => {
-            // If user is authenticated, retry with temporary Netscape cookies file
-            if let Some(session) = auth {
-                if session.is_authenticated {
-                    if let Some(cookies_file) = write_temp_netscape_cookies(session) {
-                        let res = run_yt_dlp_stdout_stream(
-                            &bin_path,
-                            video_id,
-                            Some(&cookies_file),
-                            generation_pair,
-                        )
-                        .await;
-                        if res.is_err() {
-                            let _ = fs::remove_file(&cookies_file);
-                        }
-                        if let Ok(audio) = res {
-                            return Ok(audio);
-                        }
+    let is_auth = auth.is_some_and(|s| s.is_authenticated);
+
+    // If user is authenticated, use cookies directly to prevent 1.5-4s penalty waiting for unauthenticated failure
+    if is_auth {
+        if let Some(session) = auth {
+            if let Some(cookies_file) = write_temp_netscape_cookies(session) {
+                let res = run_yt_dlp_stdout_stream(
+                    &bin_path,
+                    video_id,
+                    Some(&cookies_file),
+                    generation_pair.clone(),
+                )
+                .await;
+                let _ = fs::remove_file(&cookies_file);
+                match res {
+                    Ok(audio) => return Ok(audio),
+                    Err(e) if e == "Download cancelado (nova música selecionada)" => {
+                        return Err(e)
                     }
+                    Err(_) => {} // Fallback to unauthenticated below if cookies failed
                 }
             }
-            Err(unauth_err)
         }
     }
+
+    // Unauthenticated attempt
+    run_yt_dlp_stdout_stream(&bin_path, video_id, None, generation_pair).await
 }
 
 async fn run_yt_dlp_stdout_stream(
@@ -929,8 +1035,8 @@ async fn run_yt_dlp_stdout_stream(
 
     let mut cmd = Command::new(bin_path);
     cmd.arg("--no-playlist")
-        .arg("--js-runtimes")
-        .arg("node,deno,bun")
+        .arg("--no-config")
+        .arg("--no-exec")
         .arg("-f")
         .arg("140/bestaudio[ext=m4a]/bestaudio")
         .arg("-o")
@@ -950,9 +1056,15 @@ async fn run_yt_dlp_stdout_stream(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW prevents flashing a console window per track on Windows
+        cmd.creation_flags(0x0800_0000);
+    }
+
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Falha ao executar yt-dlp ({:?}): {e}", bin_path))?;
+        .map_err(|e| format!("Falha ao executar yt-dlp: {e}"))?;
 
     let mut stdout = child
         .stdout
@@ -1019,102 +1131,88 @@ async fn run_yt_dlp_stdout_stream(
 
     let cookies_to_cleanup = cookies_file.cloned();
 
-    // Spawn the background chunk reader on a dedicated OS thread (`std::thread::spawn`)
-    // so that even under single-threaded Tokio runtimes, background chunks are continuously
-    // pumped while `Decoder::new(progressive_buffer.reader())` probes/decodes the stream!
+    // Spawn the background chunk reader via async runtime without allocating dedicated OS thread stack
     if !eof_reached {
         let bg_buffer = progressive_buffer.clone();
         let bg_gen = generation_pair.clone();
-        let rt_handle = tokio::runtime::Handle::current();
-        std::thread::Builder::new()
-            .name(format!("ytm-stream-{video_id}"))
-            .spawn(move || {
-                rt_handle.block_on(async move {
-                    let mut bg_chunk = [0u8; 32_768];
-                    loop {
-                        if let Some((expected_gen, ref counter)) = bg_gen {
-                            if counter.load(Ordering::SeqCst) != expected_gen {
-                                let _ = child.kill().await;
-                                bg_buffer.mark_error(
-                                    "Download cancelado (nova música selecionada)".to_string(),
-                                );
-                                break;
-                            }
-                        }
+        tauri::async_runtime::spawn(async move {
+            let mut bg_chunk = [0u8; 32_768];
+            loop {
+                if let Some((expected_gen, ref counter)) = bg_gen {
+                    if counter.load(Ordering::SeqCst) != expected_gen {
+                        let _ = child.kill().await;
+                        bg_buffer
+                            .mark_error("Download cancelado (nova música selecionada)".to_string());
+                        break;
+                    }
+                }
 
-                        let read_res = tokio::time::timeout(
-                            Duration::from_secs(30),
-                            stdout.read(&mut bg_chunk),
-                        )
-                        .await;
-                        match read_res {
-                            Ok(Ok(0)) => {
-                                bg_buffer.mark_finished();
-                                break;
+                let read_res =
+                    tokio::time::timeout(Duration::from_secs(30), stdout.read(&mut bg_chunk)).await;
+                match read_res {
+                    Ok(Ok(0)) => {
+                        bg_buffer.mark_finished();
+                        break;
+                    }
+                    Ok(Ok(n)) => {
+                        let current_len = bg_buffer.len();
+                        let allowed = max_bytes.saturating_sub(current_len);
+                        if n >= allowed {
+                            if allowed > 0 {
+                                bg_buffer.push_chunk(&bg_chunk[..allowed]);
                             }
-                            Ok(Ok(n)) => {
-                                let current_len = bg_buffer.len();
-                                let allowed = max_bytes.saturating_sub(current_len);
-                                if n >= allowed {
-                                    if allowed > 0 {
-                                        bg_buffer.push_chunk(&bg_chunk[..allowed]);
-                                    }
-                                    let _ = child.kill().await;
-                                    bg_buffer.mark_finished();
-                                    break;
-                                } else {
-                                    bg_buffer.push_chunk(&bg_chunk[..n]);
-                                }
-                            }
-                            Ok(Err(e)) => {
-                                let _ = child.kill().await;
-                                bg_buffer.mark_error(format!("Erro ao ler stream de áudio: {e}"));
-                                break;
-                            }
-                            Err(_) => {
-                                let _ = child.kill().await;
-                                bg_buffer
-                                    .mark_error("Timeout no streaming progressivo".to_string());
-                                break;
-                            }
+                            let _ = child.kill().await;
+                            bg_buffer.mark_finished();
+                            break;
+                        } else {
+                            bg_buffer.push_chunk(&bg_chunk[..n]);
                         }
                     }
-                    let _ = child.wait().await;
-                    if let Some(cookie_path) = cookies_to_cleanup {
-                        let _ = fs::remove_file(cookie_path);
+                    Ok(Err(e)) => {
+                        let _ = child.kill().await;
+                        bg_buffer.mark_error(format!("Erro ao ler stream de áudio: {e}"));
+                        break;
                     }
-                });
-            })
-            .map_err(|e| format!("Falha ao criar thread de streaming progressivo: {e}"))?;
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        bg_buffer.mark_error("Timeout no streaming progressivo".to_string());
+                        break;
+                    }
+                }
+            }
+            let _ = child.wait().await;
+            if let Some(cookie_path) = cookies_to_cleanup {
+                let _ = fs::remove_file(cookie_path);
+            }
+        });
     } else if let Some(cookie_path) = cookies_to_cleanup {
         let _ = fs::remove_file(cookie_path);
     }
 
     // Fast-path: If the initial 256 KB contains a valid DASH MP4 `sidx` index box,
     // we already know the exact byte size and duration without blocking on the full stream!
-    let decoded_duration = if let Some((exact_bytes, sidx_dur)) =
-        progressive_buffer.inspect_mp4_sidx()
-    {
-        progressive_buffer.set_total_expected(exact_bytes.min(max_bytes as u64));
-        sidx_dur
-    } else {
-        // Fallback probe for non-DASH containers
-        let probe_buffer = progressive_buffer.clone();
-        let vid_owned = video_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            let decoder = Decoder::new(probe_buffer.reader()).map_err(|e| {
-                format!("Falha ao decodificar container de áudio extraído para {vid_owned}: {e}")
-            })?;
-            let dur = decoder
-                .total_duration()
-                .map(|d| d.as_secs_f64())
-                .filter(|&d| d > 1.0)
-                .unwrap_or(0.0);
-            Ok::<f64, String>(dur)
-        })
-        .await
-        .map_err(|e| format!("Erro na thread de probe de áudio: {e}"))??
-    };
+    let decoded_duration =
+        if let Some((exact_bytes, sidx_dur)) = progressive_buffer.inspect_mp4_sidx() {
+            progressive_buffer.set_total_expected(exact_bytes.min(max_bytes as u64));
+            sidx_dur
+        } else {
+            // Fallback probe for non-DASH containers
+            let probe_buffer = progressive_buffer.clone();
+            let vid_owned = video_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                let decoder = Decoder::new(probe_buffer.reader()).map_err(|e| {
+                    format!("Falha ao decodificar container de áudio para {vid_owned}: {e}")
+                })?;
+                let dur = decoder
+                    .total_duration()
+                    .map(|d| d.as_secs_f64())
+                    .filter(|&d| d > 1.0)
+                    .unwrap_or(0.0);
+                Ok::<f64, String>(dur)
+            })
+            .await
+            .map_err(|e| format!("Erro na thread de probe de áudio: {e}"))??
+        };
 
     let quality_label = if cookies_file.is_some() {
         "128 kbps M4A (yt-dlp • Streaming Progressivo Autenticado)".to_string()
@@ -1131,6 +1229,18 @@ async fn run_yt_dlp_stdout_stream(
     })
 }
 
+/// Validates that a resolved YouTube media stream URL uses HTTPS and an allowed Google/YouTube host.
+pub fn is_valid_stream_url(stream_url: &str) -> bool {
+    let Ok(parsed_url) = reqwest::Url::parse(stream_url) else {
+        return false;
+    };
+    if parsed_url.scheme() != "https" {
+        return false;
+    }
+    let host = parsed_url.host_str().unwrap_or("");
+    host.ends_with(".googlevideo.com") || host.ends_with(".youtube.com")
+}
+
 struct ClientProfile {
     name: &'static str,
     version: &'static str,
@@ -1145,10 +1255,7 @@ async fn try_fetch_innertube_audio(
     video_id: &str,
     auth: Option<&AuthSession>,
 ) -> Result<ExtractedAudio, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .build()
-        .map_err(|e| format!("Erro ao criar cliente HTTP: {e}"))?;
+    let client = crate::innertube::get_shared_http_client();
 
     let profiles = [
         ClientProfile {
@@ -1328,18 +1435,16 @@ async fn try_fetch_innertube_audio(
             continue;
         };
 
+        if !is_valid_stream_url(&stream_url) {
+            continue;
+        }
+
         let max_bytes: usize = 25 * 1024 * 1024;
-        let mut get_req = client
+        let get_req = client
             .get(&stream_url)
             .header("User-Agent", profile.user_agent)
             .header("Origin", profile.origin)
             .header("Range", format!("bytes=0-{}", max_bytes - 1));
-
-        if let Some(session) = auth {
-            if session.is_authenticated && !session.cookie_header.is_empty() {
-                get_req = get_req.header("Cookie", &session.cookie_header);
-            }
-        }
 
         let Ok(audio_resp) = get_req.send().await else {
             continue;
@@ -1382,6 +1487,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "requires live YouTube network access"]
     async fn test_real_youtube_audio_extraction_and_decoding() {
         let bin_path = ensure_yt_dlp_binary()
             .await
@@ -1411,7 +1517,7 @@ mod tests {
             "Two different YouTube video IDs must produce distinct audio buffers"
         );
 
-        // Decode on a blocking thread while the dedicated background threads pump stdout!
+        // Decode on a blocking thread while background tasks pump stdout
         let buf1 = audio1.data.clone();
         let buf2 = audio2.data.clone();
         let (samples_1, samples_2) = tokio::task::spawn_blocking(move || {
@@ -1466,5 +1572,267 @@ mod tests {
         assert_eq!(out, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert!(buffer.is_finished());
         assert_eq!(buffer.len(), 10);
+    }
+
+    fn build_mp4_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let total_len = (8 + payload.len()) as u32;
+        let mut out = Vec::with_capacity(total_len as usize);
+        out.extend_from_slice(&total_len.to_be_bytes());
+        out.extend_from_slice(box_type);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn build_sidx_v0(
+        timescale: u32,
+        earliest_pts: u32,
+        first_offset: u32,
+        refs: &[(u32, u32)],
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8, 0, 0, 0]); // version=0, flags=0
+        payload.extend_from_slice(&1u32.to_be_bytes()); // reference_ID
+        payload.extend_from_slice(&timescale.to_be_bytes());
+        payload.extend_from_slice(&earliest_pts.to_be_bytes());
+        payload.extend_from_slice(&first_offset.to_be_bytes());
+        payload.extend_from_slice(&0u16.to_be_bytes()); // reserved
+        payload.extend_from_slice(&(refs.len() as u16).to_be_bytes());
+        for &(raw_size, sub_dur) in refs {
+            payload.extend_from_slice(&raw_size.to_be_bytes());
+            payload.extend_from_slice(&sub_dur.to_be_bytes());
+            payload.extend_from_slice(&0u32.to_be_bytes()); // SAP info
+        }
+        build_mp4_box(b"sidx", &payload)
+    }
+
+    fn build_sidx_v1(
+        timescale: u32,
+        earliest_pts: u64,
+        first_offset: u64,
+        refs: &[(u32, u32)],
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[1u8, 0, 0, 0]); // version=1, flags=0
+        payload.extend_from_slice(&1u32.to_be_bytes()); // reference_ID
+        payload.extend_from_slice(&timescale.to_be_bytes());
+        payload.extend_from_slice(&earliest_pts.to_be_bytes());
+        payload.extend_from_slice(&first_offset.to_be_bytes());
+        payload.extend_from_slice(&0u16.to_be_bytes()); // reserved
+        payload.extend_from_slice(&(refs.len() as u16).to_be_bytes());
+        for &(raw_size, sub_dur) in refs {
+            payload.extend_from_slice(&raw_size.to_be_bytes());
+            payload.extend_from_slice(&sub_dur.to_be_bytes());
+            payload.extend_from_slice(&0u32.to_be_bytes()); // SAP info
+        }
+        build_mp4_box(b"sidx", &payload)
+    }
+
+    #[test]
+    fn test_parse_mp4_sidx_metadata_valid_v0_and_v1() {
+        let ftyp = build_mp4_box(b"ftyp", b"M4A \x00\x00\x00\x00M4A mp42");
+        // Include MSB bit set (0x8000_0000) on first ref to ensure reference_type bit is masked out
+        let sidx_v0 = build_sidx_v0(44_100, 0, 128, &[(0x8000_0000 | 1000, 44_100), (2500, 88_200)]);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&ftyp);
+        stream.extend_from_slice(&sidx_v0);
+
+        let expected_sidx_end = (ftyp.len() + sidx_v0.len()) as u64;
+        let (total_bytes, duration_secs) =
+            parse_mp4_sidx_metadata(&stream).expect("valid v0 sidx box should parse");
+        assert_eq!(total_bytes, expected_sidx_end + 128 + 1000 + 2500);
+        assert!((duration_secs - 3.0).abs() < 1e-6);
+
+        // Test version 1 with 64-bit first_offset
+        let sidx_v1 = build_sidx_v1(48_000, 0, 512, &[(4096, 96_000)]);
+        let (v1_bytes, v1_dur) =
+            parse_mp4_sidx_metadata(&sidx_v1).expect("valid v1 sidx box should parse");
+        assert_eq!(v1_bytes, (sidx_v1.len() as u64) + 512 + 4096);
+        assert!((v1_dur - 2.0).abs() < 1e-6);
+
+        // Timescale == 0 should safely return 0.0 duration without NaN/Inf
+        let zero_ts = build_sidx_v0(0, 0, 0, &[(1024, 1000)]);
+        let (_, dur_zero) = parse_mp4_sidx_metadata(&zero_ts).unwrap();
+        assert_eq!(dur_zero, 0.0);
+    }
+
+    #[test]
+    fn test_parse_mp4_sidx_metadata_invalid_and_truncated() {
+        assert_eq!(parse_mp4_sidx_metadata(&[]), None);
+        assert_eq!(parse_mp4_sidx_metadata(b"short"), None);
+
+        // Box size < 8 (invalid size=0 or size=4)
+        let mut zero_size = vec![0, 0, 0, 0];
+        zero_size.extend_from_slice(b"ftyp");
+        assert_eq!(parse_mp4_sidx_metadata(&zero_size), None);
+
+        // Only ftyp box, no sidx
+        let ftyp_only = build_mp4_box(b"ftyp", b"M4A \x00\x00\x00\x00");
+        assert_eq!(parse_mp4_sidx_metadata(&ftyp_only), None);
+
+        // Valid sidx truncated mid-buffer
+        let valid_sidx = build_sidx_v0(44_100, 0, 0, &[(1000, 44_100)]);
+        assert_eq!(
+            parse_mp4_sidx_metadata(&valid_sidx[..valid_sidx.len() - 4]),
+            None
+        );
+
+        // Declared size < 32 for sidx
+        let tiny_sidx = build_mp4_box(b"sidx", &[0u8; 16]);
+        assert_eq!(parse_mp4_sidx_metadata(&tiny_sidx), None);
+
+        // Version 1 box smaller than minimum 40 bytes
+        let mut short_v1 = vec![1u8, 0, 0, 0];
+        short_v1.extend_from_slice(&[0u8; 20]); // total box size = 32 < 40
+        let short_v1_box = build_mp4_box(b"sidx", &short_v1);
+        assert_eq!(parse_mp4_sidx_metadata(&short_v1_box), None);
+
+        // Reference count larger than payload
+        let mut bad_ref_count = build_sidx_v0(44_100, 0, 0, &[(100, 100)]);
+        // Overwrite ref_count at offset 30..32 (box header 8 + 22 = 30) with 99
+        bad_ref_count[30] = 0;
+        bad_ref_count[31] = 99;
+        assert_eq!(parse_mp4_sidx_metadata(&bad_ref_count), None);
+    }
+
+    #[test]
+    fn test_progressive_audio_buffer_empty_finished_and_error_states() {
+        let empty_done = ProgressiveAudioBuffer::new(64, None);
+        empty_done.mark_finished();
+        assert!(empty_done.is_empty());
+        assert!(empty_done.is_finished());
+        let mut r = empty_done.reader();
+        let mut buf = [0u8; 16];
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+
+        // Empty read slice should immediately return Ok(0)
+        assert_eq!(r.read(&mut []).unwrap(), 0);
+
+        // Error on empty buffer propagates io::Error
+        let err_buf = ProgressiveAudioBuffer::new(64, None);
+        err_buf.mark_error("stream aborted".to_string());
+        assert!(err_buf.is_finished());
+        let err = err_buf.reader().read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(err.to_string().contains("stream aborted"));
+
+        // Non-empty buffer with mark_error still drains buffered bytes before EOF
+        let partial_err = ProgressiveAudioBuffer::new(64, None);
+        partial_err.push_chunk(&[]); // empty chunk is a no-op
+        partial_err.push_chunk(b"ABC");
+        partial_err.mark_error("late failure".to_string());
+        let mut out = Vec::new();
+        partial_err.reader().read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"ABC");
+    }
+
+    #[test]
+    fn test_progressive_audio_buffer_seek_and_sidx_end_offset() {
+        let buf = ProgressiveAudioBuffer::from_vec(b"0123456789".to_vec());
+        assert_eq!(buf.current_bytes_len(), 10);
+        assert_eq!(buf, ProgressiveAudioBuffer::from(b"0123456789".to_vec()));
+
+        let mut reader = buf.reader();
+        assert_eq!(reader.seek(SeekFrom::Start(4)).unwrap(), 4);
+        let mut two = [0u8; 2];
+        reader.read_exact(&mut two).unwrap();
+        assert_eq!(&two, b"45");
+
+        assert_eq!(reader.seek(SeekFrom::Current(-3)).unwrap(), 3);
+        reader.read_exact(&mut two).unwrap();
+        assert_eq!(&two, b"34");
+
+        assert_eq!(reader.seek(SeekFrom::End(-2)).unwrap(), 8);
+        reader.read_exact(&mut two).unwrap();
+        assert_eq!(&two, b"89");
+
+        // Seeking past EOF when finished clamps to len()
+        assert_eq!(reader.seek(SeekFrom::Start(999)).unwrap(), 10);
+        assert_eq!(reader.read(&mut two).unwrap(), 0);
+
+        // Seeking before byte 0 returns InvalidInput
+        let neg_err = reader.seek(SeekFrom::Current(-100)).unwrap_err();
+        assert_eq!(neg_err.kind(), io::ErrorKind::InvalidInput);
+        let neg_end_err = reader.seek(SeekFrom::End(-50)).unwrap_err();
+        assert_eq!(neg_end_err.kind(), io::ErrorKind::InvalidInput);
+
+        // In-flight buffer containing valid sidx box resolves SeekFrom::End(0) immediately
+        let sidx = build_sidx_v0(44_100, 0, 100, &[(500, 44_100)]);
+        let expected_total = (sidx.len() as u64) + 100 + 500;
+        let inflight = ProgressiveAudioBuffer::new(1024, None);
+        inflight.push_chunk(&sidx);
+        assert_eq!(
+            inflight.inspect_mp4_sidx(),
+            Some((expected_total, 1.0))
+        );
+        let mut inflight_reader = inflight.reader();
+        assert_eq!(
+            inflight_reader.seek(SeekFrom::End(0)).unwrap(),
+            expected_total
+        );
+    }
+
+    #[test]
+    fn test_is_valid_stream_url_and_parse_youtube_video_id() {
+        assert!(is_valid_stream_url(
+            "https://rr1---sn-4g5e6nsz.googlevideo.com/videoplayback?itag=140"
+        ));
+        assert!(is_valid_stream_url(
+            "https://music.youtube.com/api/stream/123"
+        ));
+        assert!(!is_valid_stream_url(
+            "http://rr1---sn-4g5e6nsz.googlevideo.com/videoplayback"
+        ));
+        assert!(!is_valid_stream_url(
+            "https://googlevideo.com.evil.example/videoplayback"
+        ));
+        assert!(!is_valid_stream_url(
+            "https://youtube.com.attacker.net/watch"
+        ));
+        assert!(!is_valid_stream_url("not a valid url"));
+        assert!(!is_valid_stream_url("ftp://r1.googlevideo.com/a"));
+
+        assert_eq!(
+            parse_youtube_video_id("https://music.youtube.com/watch?v=MV_3Dpw-BRY&list=RDAMVM"),
+            "MV_3Dpw-BRY"
+        );
+        assert_eq!(
+            parse_youtube_video_id("https://youtu.be/fJ9rUzIMcZQ?t=42"),
+            "fJ9rUzIMcZQ"
+        );
+        assert_eq!(
+            parse_youtube_video_id("https://www.youtube.com/embed/4NRXx6U8ABQ"),
+            "4NRXx6U8ABQ"
+        );
+        assert_eq!(
+            parse_youtube_video_id("https://www.youtube.com/shorts/FGBhQbmPwH8"),
+            "FGBhQbmPwH8"
+        );
+        assert_eq!(parse_youtube_video_id("  dQw4w9WgXcQ  "), "dQw4w9WgXcQ");
+        assert_eq!(parse_youtube_video_id("   "), "dQw4w9WgXcQ");
+        assert_eq!(parse_youtube_video_id("id!@#with$%^junk"), "idwithjunk");
+    }
+
+    #[test]
+    fn test_cross_platform_yt_dlp_paths_and_redirect_allowlist() {
+        let url = get_yt_dlp_download_url();
+        assert!(url.starts_with("https://github.com/yt-dlp/yt-dlp/releases/latest/download/"));
+        let bin_name = get_yt_dlp_binary_name();
+        let bin_path = get_yt_dlp_bin_path();
+        assert_eq!(
+            bin_path.file_name().and_then(|n| n.to_str()),
+            Some(bin_name)
+        );
+
+        let gh = reqwest::Url::parse("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp").unwrap();
+        let gh_cdn = reqwest::Url::parse("https://objects.githubusercontent.com/github-production-release-asset/123").unwrap();
+        let gh_release_assets = reqwest::Url::parse("https://release-assets.githubusercontent.com/file").unwrap();
+        let http_gh = reqwest::Url::parse("http://github.com/yt-dlp/yt-dlp").unwrap();
+        let evil = reqwest::Url::parse("https://evil.example.com/yt-dlp").unwrap();
+
+        assert!(is_trusted_yt_dlp_download_url(&gh));
+        assert!(is_trusted_yt_dlp_download_url(&gh_cdn));
+        assert!(is_trusted_yt_dlp_download_url(&gh_release_assets));
+        assert!(!is_trusted_yt_dlp_download_url(&http_gh));
+        assert!(!is_trusted_yt_dlp_download_url(&evil));
     }
 }
