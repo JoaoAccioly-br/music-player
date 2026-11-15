@@ -1,7 +1,7 @@
 {
   "name": "youtube-music-rust",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Ultra-lightweight YouTube Music desktop client built with Tauri v2, Rust, and Vue 3 (Zero-WebView Background Mode)",
   "type": "module",
   "scripts": {
