@@ -22,6 +22,12 @@ pub const YT_DLP_WINDOWS_URL: &str =
 pub const YT_DLP_MACOS_URL: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos";
 
+/// Sentinel returned by `ProgressiveReader::seek(SeekFrom::End(0))` when a progressive stream
+/// is still in flight and does not have an upfront total byte length (e.g. non-DASH container).
+/// `ReadSeekSource::new()` maps this sentinel to `byte_len = None` so Symphonia never seeks
+/// to a fake EOF offset or blocks waiting for the entire network stream before probing headers.
+pub const UNKNOWN_PROGRESSIVE_END_SENTINEL: u64 = u64::MAX / 4;
+
 /// Returns the official yt-dlp standalone release URL for the current OS and architecture.
 pub fn get_yt_dlp_download_url() -> &'static str {
     #[cfg(target_os = "windows")]
@@ -32,11 +38,19 @@ pub fn get_yt_dlp_download_url() -> &'static str {
     {
         YT_DLP_MACOS_URL
     }
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos"), target_arch = "aarch64"))]
+    #[cfg(all(
+        not(target_os = "windows"),
+        not(target_os = "macos"),
+        target_arch = "aarch64"
+    ))]
     {
         YT_DLP_LINUX_AARCH64_URL
     }
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos"), not(target_arch = "aarch64")))]
+    #[cfg(all(
+        not(target_os = "windows"),
+        not(target_os = "macos"),
+        not(target_arch = "aarch64")
+    ))]
     {
         YT_DLP_LINUX_URL
     }
@@ -403,7 +417,12 @@ impl Seek for ProgressiveReader {
                 if !state.finished && state.total_expected.is_none() {
                     if let Some((exact_bytes, _)) = parse_mp4_sidx_metadata(&state.data) {
                         state.total_expected = Some(exact_bytes.min(25 * 1024 * 1024));
-                    } else {
+                    } else if delta != 0 {
+                        // Only wait for stream completion if a caller is explicitly seeking
+                        // to a negative offset relative to the end (`SeekFrom::End(-N)`).
+                        // When `delta == 0` (`ReadSeekSource::new()` probing `byte_len()`),
+                        // return `UNKNOWN_PROGRESSIVE_END_SENTINEL` immediately so non-DASH
+                        // streams (MP3, OGG, WAV, FLAC) start playing without blocking!
                         while !state.finished && state.total_expected.is_none() {
                             let (new_state, timeout_res) = self
                                 .buffer
@@ -424,7 +443,13 @@ impl Seek for ProgressiveReader {
                 let end_len = if state.finished {
                     state.data.len() as u64
                 } else {
-                    state.total_expected.unwrap_or(state.data.len() as u64)
+                    state.total_expected.unwrap_or_else(|| {
+                        if delta == 0 {
+                            UNKNOWN_PROGRESSIVE_END_SENTINEL
+                        } else {
+                            state.data.len() as u64
+                        }
+                    })
                 };
                 (end_len as i128) + (delta as i128)
             }
@@ -568,37 +593,61 @@ impl AudioEngine {
                                     }
 
                                     let mut init_error: Option<String> = None;
-                                    if let Some((_, ref stream_handle)) = stream_opt {
+
+                                    if stream_opt.is_none() {
+                                        if let Err(e) = OutputStream::try_default() {
+                                            init_error = Some(format!(
+                                                "Nenhum dispositivo de saída de áudio disponível no sistema ({e})."
+                                            ));
+                                        }
+                                    }
+
+                                    // Try creating a Sink on the active OutputStream; if the OS audio
+                                    // endpoint changed or disconnected (common on Windows WASAPI when
+                                    // switching headphones/Bluetooth/HDMI), re-initialize OutputStream once!
+                                    let new_sink_res = if let Some((_, ref stream_handle)) = stream_opt {
                                         match Sink::try_new(stream_handle) {
-                                            Ok(new_sink) => {
-                                                new_sink.set_volume(current_volume);
-                                                match Decoder::new(data.reader()) {
-                                                    Ok(decoder) => {
-                                                        new_sink.append(decoder);
-                                                        new_sink.play();
-                                                        sink_opt = Some(new_sink);
-                                                        thread_telemetry
-                                                            .has_active_track
-                                                            .store(true, Ordering::Relaxed);
-                                                    }
-                                                    Err(e) => {
-                                                        init_error = Some(format!(
-                                                            "Falha ao decodificar fluxo de áudio: {e}"
-                                                        ));
-                                                    }
+                                            Ok(sink) => Ok(sink),
+                                            Err(_) => {
+                                                stream_opt = OutputStream::try_default().ok();
+                                                if let Some((_, ref fresh_handle)) = stream_opt {
+                                                    Sink::try_new(fresh_handle).map_err(|e| {
+                                                        format!("Falha ao abrir canal de saída de áudio: {e}")
+                                                    })
+                                                } else {
+                                                    Err("Dispositivo de saída de áudio desconectado ou indisponível.".to_string())
                                                 }
-                                            }
-                                            Err(e) => {
-                                                init_error = Some(format!(
-                                                    "Falha ao abrir canal de saída de áudio: {e}"
-                                                ));
                                             }
                                         }
                                     } else {
-                                        init_error = Some(
+                                        Err(init_error.take().unwrap_or_else(|| {
                                             "Nenhum dispositivo de saída de áudio disponível no sistema."
-                                                .to_string(),
-                                        );
+                                                .to_string()
+                                        }))
+                                    };
+
+                                    match new_sink_res {
+                                        Ok(new_sink) => {
+                                            new_sink.set_volume(current_volume);
+                                            match Decoder::new(data.reader()) {
+                                                Ok(decoder) => {
+                                                    new_sink.append(decoder);
+                                                    new_sink.play();
+                                                    sink_opt = Some(new_sink);
+                                                    thread_telemetry
+                                                        .has_active_track
+                                                        .store(true, Ordering::Relaxed);
+                                                }
+                                                Err(e) => {
+                                                    init_error = Some(format!(
+                                                        "Falha ao decodificar fluxo de áudio: {e}"
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        Err(err_msg) => {
+                                            init_error = Some(err_msg);
+                                        }
                                     }
 
                                     if let Some(err_msg) = init_error {
@@ -726,14 +775,18 @@ impl AudioEngine {
             AudioCommand::LoadAndPlay { .. } => {
                 self.telemetry.position_ms.store(0, Ordering::Relaxed);
                 self.telemetry.is_sink_empty.store(false, Ordering::Relaxed);
-                self.telemetry.has_active_track.store(false, Ordering::Relaxed);
+                self.telemetry
+                    .has_active_track
+                    .store(false, Ordering::Relaxed);
             }
             AudioCommand::Seek(_) => {
                 self.telemetry.is_sink_empty.store(false, Ordering::Relaxed);
             }
             AudioCommand::Stop => {
                 self.telemetry.is_sink_empty.store(true, Ordering::Relaxed);
-                self.telemetry.has_active_track.store(false, Ordering::Relaxed);
+                self.telemetry
+                    .has_active_track
+                    .store(false, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -1102,7 +1155,9 @@ async fn run_yt_dlp_stdout_stream(
         .arg("--no-config")
         .arg("--no-exec")
         .arg("-f")
-        .arg("140/bestaudio[ext=m4a]/bestaudio")
+        // Only select containers/codecs supported by rodio + Symphonia (M4A/AAC, MP4, MP3, OGG/Vorbis, FLAC, WAV)
+        // so yt-dlp never falls back to WebM/Opus (`itag 251`) which Symphonia cannot demux.
+        .arg("140/bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio[ext=mp3]/bestaudio[ext=ogg]/bestaudio[acodec^=mp4a]")
         .arg("-o")
         .arg("-")
         .arg("--quiet")
@@ -1178,6 +1233,7 @@ async fn run_yt_dlp_stdout_stream(
 
     if progressive_buffer.len() < 16_384 {
         let status = child.wait().await.ok();
+        let exit_code = status.and_then(|s| s.code());
         let mut err_msg = String::new();
         if let Some(ref mut err_pipe) = stderr {
             let _ = err_pipe.read_to_string(&mut err_msg).await;
@@ -1186,10 +1242,18 @@ async fn run_yt_dlp_stdout_stream(
         if !clean_err.is_empty() {
             return Err(format!("yt-dlp falhou para {video_id}: {clean_err}"));
         }
+        // On Windows, exit code -1073741515 (0xC0000135 STATUS_DLL_NOT_FOUND) indicates
+        // Microsoft Visual C++ Redistributable (vcruntime140.dll) is missing on the machine.
+        if exit_code == Some(-1073741515) {
+            return Err(
+                "O yt-dlp.exe requer o Microsoft Visual C++ Redistributable (x64) instalado no Windows."
+                    .to_string(),
+            );
+        }
         return Err(format!(
             "yt-dlp retornou buffer insuficiente ({} bytes, status: {:?}) para {video_id}",
             progressive_buffer.len(),
-            status.and_then(|s| s.code())
+            exit_code
         ));
     }
 
@@ -1253,30 +1317,33 @@ async fn run_yt_dlp_stdout_stream(
         let _ = fs::remove_file(cookie_path);
     }
 
-    // Fast-path: If the initial 256 KB contains a valid DASH MP4 `sidx` index box,
-    // we already know the exact byte size and duration without blocking on the full stream!
-    let decoded_duration =
-        if let Some((exact_bytes, sidx_dur)) = progressive_buffer.inspect_mp4_sidx() {
-            progressive_buffer.set_total_expected(exact_bytes.min(max_bytes as u64));
-            sidx_dur
-        } else {
-            // Fallback probe for non-DASH containers
-            let probe_buffer = progressive_buffer.clone();
-            let vid_owned = video_id.to_string();
-            tokio::task::spawn_blocking(move || {
-                let decoder = Decoder::new(probe_buffer.reader()).map_err(|e| {
-                    format!("Falha ao decodificar container de áudio para {vid_owned}: {e}")
-                })?;
-                let dur = decoder
-                    .total_duration()
-                    .map(|d| d.as_secs_f64())
-                    .filter(|&d| d > 1.0)
-                    .unwrap_or(0.0);
-                Ok::<f64, String>(dur)
-            })
-            .await
-            .map_err(|e| format!("Erro na thread de probe de áudio: {e}"))??
-        };
+    // Always verify that `rodio::Decoder` can actually initialize on the stream before returning
+    // `Ok(ExtractedAudio)`, and use the `sidx` duration when present.
+    let sidx_meta = progressive_buffer.inspect_mp4_sidx();
+    if let Some((exact_bytes, _)) = sidx_meta {
+        progressive_buffer.set_total_expected(exact_bytes.min(max_bytes as u64));
+    }
+
+    let probe_buffer = progressive_buffer.clone();
+    let vid_owned = video_id.to_string();
+    let probed_duration = tokio::task::spawn_blocking(move || {
+        let decoder = Decoder::new(probe_buffer.reader()).map_err(|e| {
+            format!("Falha ao decodificar container de áudio para {vid_owned}: {e}")
+        })?;
+        let dur = decoder
+            .total_duration()
+            .map(|d| d.as_secs_f64())
+            .filter(|&d| d > 1.0)
+            .unwrap_or(0.0);
+        Ok::<f64, String>(dur)
+    })
+    .await
+    .map_err(|e| format!("Erro na thread de probe de áudio: {e}"))??;
+
+    let decoded_duration = sidx_meta
+        .map(|(_, sidx_dur)| sidx_dur)
+        .filter(|&d| d > 1.0)
+        .unwrap_or(probed_duration);
 
     let quality_label = if cookies_file.is_some() {
         "128 kbps M4A (yt-dlp • Streaming Progressivo Autenticado)".to_string()
@@ -1477,13 +1544,17 @@ async fn try_fetch_innertube_audio(
             if !mime.starts_with("audio/") {
                 continue;
             }
+            // Skip `audio/webm` (Opus/Matroska) because Symphonia does not include an MKV/WebM demuxer
+            if mime.starts_with("audio/webm") {
+                continue;
+            }
             let itag = fmt.get("itag").and_then(|i| i.as_i64()).unwrap_or(0);
 
             let score = if itag == 140 {
                 100
             } else if mime.starts_with("audio/mp4") {
                 80
-            } else if mime.starts_with("audio/webm") || mime.starts_with("audio/ogg") {
+            } else if mime.starts_with("audio/ogg") || mime.starts_with("audio/mpeg") {
                 50
             } else {
                 20
@@ -1695,7 +1766,12 @@ mod tests {
     fn test_parse_mp4_sidx_metadata_valid_v0_and_v1() {
         let ftyp = build_mp4_box(b"ftyp", b"M4A \x00\x00\x00\x00M4A mp42");
         // Include MSB bit set (0x8000_0000) on first ref to ensure reference_type bit is masked out
-        let sidx_v0 = build_sidx_v0(44_100, 0, 128, &[(0x8000_0000 | 1000, 44_100), (2500, 88_200)]);
+        let sidx_v0 = build_sidx_v0(
+            44_100,
+            0,
+            128,
+            &[(0x8000_0000 | 1000, 44_100), (2500, 88_200)],
+        );
         let mut stream = Vec::new();
         stream.extend_from_slice(&ftyp);
         stream.extend_from_slice(&sidx_v0);
@@ -1824,14 +1900,26 @@ mod tests {
         let expected_total = (sidx.len() as u64) + 100 + 500;
         let inflight = ProgressiveAudioBuffer::new(1024, None);
         inflight.push_chunk(&sidx);
-        assert_eq!(
-            inflight.inspect_mp4_sidx(),
-            Some((expected_total, 1.0))
-        );
+        assert_eq!(inflight.inspect_mp4_sidx(), Some((expected_total, 1.0)));
         let mut inflight_reader = inflight.reader();
         assert_eq!(
             inflight_reader.seek(SeekFrom::End(0)).unwrap(),
             expected_total
+        );
+
+        // In-flight buffer WITHOUT sidx box returns UNKNOWN_PROGRESSIVE_END_SENTINEL immediately
+        // on SeekFrom::End(0) without blocking for 20s!
+        let non_dash_inflight = ProgressiveAudioBuffer::new(1024, None);
+        non_dash_inflight.push_chunk(b"ID3-or-OggS-header-bytes");
+        let mut non_dash_reader = non_dash_inflight.reader();
+        let start_instant = std::time::Instant::now();
+        assert_eq!(
+            non_dash_reader.seek(SeekFrom::End(0)).unwrap(),
+            UNKNOWN_PROGRESSIVE_END_SENTINEL
+        );
+        assert!(
+            start_instant.elapsed() < Duration::from_millis(200),
+            "SeekFrom::End(0) on in-flight non-DASH stream must not block!"
         );
     }
 
@@ -1887,9 +1975,15 @@ mod tests {
             Some(bin_name)
         );
 
-        let gh = reqwest::Url::parse("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp").unwrap();
-        let gh_cdn = reqwest::Url::parse("https://objects.githubusercontent.com/github-production-release-asset/123").unwrap();
-        let gh_release_assets = reqwest::Url::parse("https://release-assets.githubusercontent.com/file").unwrap();
+        let gh =
+            reqwest::Url::parse("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp")
+                .unwrap();
+        let gh_cdn = reqwest::Url::parse(
+            "https://objects.githubusercontent.com/github-production-release-asset/123",
+        )
+        .unwrap();
+        let gh_release_assets =
+            reqwest::Url::parse("https://release-assets.githubusercontent.com/file").unwrap();
         let http_gh = reqwest::Url::parse("http://github.com/yt-dlp/yt-dlp").unwrap();
         let evil = reqwest::Url::parse("https://evil.example.com/yt-dlp").unwrap();
 

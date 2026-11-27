@@ -5,9 +5,11 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rodio::{Decoder, Source};
 use youtube_music_rust_lib::audio::{
     clean_temp_cookie_files, get_temp_cookie_dir, is_valid_stream_url, parse_mp4_sidx_metadata,
     parse_youtube_video_id, write_temp_netscape_cookies, ProgressiveAudioBuffer,
+    UNKNOWN_PROGRESSIVE_END_SENTINEL,
 };
 use youtube_music_rust_lib::auth::{
     build_session_from_cookie_str, clear_session_on_disk, extract_sapisid_from_cookie,
@@ -149,6 +151,41 @@ fn build_test_sidx_header(timescale: u32, first_offset: u32, refs: &[(u32, u32)]
     out
 }
 
+/// Builds a valid stereo 16-bit PCM WAV container in memory so `ProgressiveAudioBuffer` +
+/// `ReadSeekSource` + Symphonia `rodio::Decoder` can be tested end-to-end across Linux, Windows, and macOS
+/// without requiring live network access or hardware audio output.
+fn build_test_wav_pcm16_stereo(sample_rate: u32, num_frames: usize) -> Vec<u8> {
+    let channels: u16 = 2;
+    let bits_per_sample: u16 = 16;
+    let block_align: u16 = channels * (bits_per_sample / 8);
+    let byte_rate: u32 = sample_rate * (block_align as u32);
+    let data_bytes_len: u32 = (num_frames as u32) * (block_align as u32);
+    let riff_chunk_size: u32 = 36 + data_bytes_len;
+
+    let mut wav = Vec::with_capacity((44 + data_bytes_len) as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_chunk_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+    wav.extend_from_slice(&1u16.to_le_bytes()); // AudioFormat = 1 (PCM)
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes_len.to_le_bytes());
+
+    for i in 0..num_frames {
+        let sample_l = (((i * 97) % 16_000) as i16).wrapping_sub(8_000);
+        let sample_r = (((i * 53) % 16_000) as i16).wrapping_sub(8_000);
+        wav.extend_from_slice(&sample_l.to_le_bytes());
+        wav.extend_from_slice(&sample_r.to_le_bytes());
+    }
+    wav
+}
+
 fn make_track(video_id: &str, title: &str, duration_secs: f64) -> TrackItem {
     TrackItem {
         video_id: video_id.to_string(),
@@ -262,6 +299,77 @@ fn test_progressive_audio_buffer_read_seek_with_sidx_metadata() {
     assert_eq!(
         reader.seek(SeekFrom::Current(-5000)).unwrap_err().kind(),
         std::io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn test_progressive_audio_buffer_symphonia_decoder_and_seek_across_os() {
+    // 2.0 seconds of stereo 44.1 kHz 16-bit PCM (88_200 frames = 176_400 samples = 352_800 data bytes > 64 KB MediaSourceStream buffer)
+    let sample_rate = 44_100;
+    let total_frames = 88_200;
+    let wav_bytes = build_test_wav_pcm16_stereo(sample_rate, total_frames);
+
+    // Create an in-flight ProgressiveAudioBuffer WITHOUT total_expected (simulating a non-DASH stream)
+    let prog_buffer = ProgressiveAudioBuffer::new(wav_bytes.len(), None);
+    // Push the initial 96 KB chunk (matching our 256 KB initial threshold in production, > 64 KB Symphonia ring buffer)
+    // so the stream is still in-flight (`finished == false`)
+    let initial_bytes = 96 * 1024;
+    prog_buffer.push_chunk(&wav_bytes[..initial_bytes]);
+    assert!(!prog_buffer.is_finished());
+
+    // Verify SeekFrom::End(0) returns UNKNOWN_PROGRESSIVE_END_SENTINEL immediately without blocking
+    let mut sentinel_check_reader = prog_buffer.reader();
+    assert_eq!(
+        sentinel_check_reader.seek(SeekFrom::End(0)).unwrap(),
+        UNKNOWN_PROGRESSIVE_END_SENTINEL
+    );
+
+    // Initialize Symphonia `rodio::Decoder` while the stream is still in-flight!
+    // If `ReadSeekSource::new()` did not filter out `UNKNOWN_PROGRESSIVE_END_SENTINEL`, or if
+    // `SeekFrom::End(0)` blocked waiting for `mark_finished`, this would stall for 20s.
+    let start_init = std::time::Instant::now();
+    let mut decoder = Decoder::new(prog_buffer.reader()).expect(
+        "Symphonia Decoder::new must initialize immediately on in-flight ProgressiveAudioBuffer",
+    );
+    assert!(
+        start_init.elapsed() < Duration::from_secs(2),
+        "Decoder::new must not block waiting for full stream completion"
+    );
+    assert_eq!(decoder.channels(), 2);
+    assert_eq!(decoder.sample_rate(), sample_rate);
+
+    // Spawn a background writer thread that feeds the rest of the audio chunks progressively
+    let bg_writer = prog_buffer.clone();
+    let remaining_bytes = wav_bytes[initial_bytes..].to_vec();
+    let writer_handle = std::thread::spawn(move || {
+        for chunk in remaining_bytes.chunks(16_384) {
+            std::thread::sleep(Duration::from_millis(5));
+            bg_writer.push_chunk(chunk);
+        }
+        bg_writer.mark_finished();
+    });
+
+    // Decode all interleaved samples across progressive chunk boundaries
+    let decoded_samples: Vec<i16> = (&mut decoder).collect();
+    writer_handle.join().unwrap();
+
+    assert!(prog_buffer.is_finished());
+    assert_eq!(
+        decoded_samples.len(),
+        total_frames * 2,
+        "Decoder must yield all stereo samples across progressive chunks"
+    );
+
+    // Verify `try_seek` works accurately on a fresh Decoder over the completed buffer
+    let mut seek_decoder = Decoder::new(prog_buffer.reader()).unwrap();
+    seek_decoder
+        .try_seek(Duration::from_millis(1000))
+        .expect("Symphonia decoder try_seek must succeed");
+    let remaining_after_seek: usize = seek_decoder.count();
+    // Seeking to 1.0s of a 2.0s stereo stream should leave roughly half the samples (~88_200)
+    assert!(
+        remaining_after_seek >= 80_000 && remaining_after_seek <= 96_000,
+        "Expected ~88200 samples after seeking to 1000ms, got {remaining_after_seek}"
     );
 }
 

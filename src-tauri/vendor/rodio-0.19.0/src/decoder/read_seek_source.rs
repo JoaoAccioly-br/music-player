@@ -2,6 +2,12 @@ use std::io::{Read, Result, Seek, SeekFrom};
 
 use symphonia::core::io::MediaSource;
 
+/// Sentinel returned by `ProgressiveReader::seek(SeekFrom::End(0))` when a progressive stream
+/// is still in flight and does not have an upfront total byte length (e.g. non-DASH container).
+/// `ReadSeekSource::new()` maps this sentinel to `byte_len = None` so Symphonia never seeks
+/// to a fake EOF offset or blocks waiting for the entire network stream before probing headers.
+const UNKNOWN_PROGRESSIVE_END_SENTINEL: u64 = u64::MAX / 4;
+
 pub struct ReadSeekSource<T: Read + Seek + Send + Sync> {
     inner: T,
     byte_len: Option<u64>,
@@ -16,9 +22,9 @@ impl<T: Read + Seek + Send + Sync> ReadSeekSource<T> {
             let end_pos = inner.seek(SeekFrom::End(0)).ok();
             let _ = inner.seek(SeekFrom::Start(current_pos));
             // When streaming progressively without a known total length, `ProgressiveReader`
-            // returns `u64::MAX / 4` for `SeekFrom::End(0)`. Filter that out so `byte_len()`
-            // returns `None` and Symphonia never seeks to a fake EOF offset!
-            end_pos
+            // returns `UNKNOWN_PROGRESSIVE_END_SENTINEL` (`u64::MAX / 4`) for `SeekFrom::End(0)`.
+            // Filter that out so `byte_len()` returns `None` and Symphonia never seeks to a fake EOF offset!
+            end_pos.filter(|&len| len < UNKNOWN_PROGRESSIVE_END_SENTINEL)
         } else {
             None
         };

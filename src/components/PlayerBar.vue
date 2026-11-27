@@ -95,28 +95,28 @@ function toggleMute() {
 </script>
 
 <template>
+  <!-- Discreet Error Toast visible in both normal and fullscreen modes -->
+  <div
+    v-if="player.errorMessage"
+    class="fixed bottom-24 left-1/2 -translate-x-1/2 w-[calc(100%-1.5rem)] sm:w-[calc(100%-3rem)] max-w-xl z-50 pointer-events-auto flex items-center justify-between gap-3 px-4 py-2.5 rounded-2xl bg-rose-950/95 border border-rose-500/40 text-rose-100 text-xs shadow-xl backdrop-blur-md"
+  >
+    <div class="flex items-center gap-2 min-w-0">
+      <AlertCircle class="w-4 h-4 text-rose-400 shrink-0" />
+      <span class="break-words">{{ player.errorMessage }}</span>
+    </div>
+    <button
+      type="button"
+      @click="player.dismissError()"
+      class="p-1 rounded-full hover:bg-white/10 text-rose-200 transition-colors shrink-0"
+    >
+      <X class="w-3.5 h-3.5" />
+    </button>
+  </div>
+
   <div
     v-if="!player.isFullscreenPlayer"
     class="fixed bottom-3.5 left-1/2 -translate-x-1/2 w-[calc(100%-1.5rem)] sm:w-[calc(100%-3rem)] max-w-4xl z-30 pointer-events-none flex flex-col items-center gap-2"
   >
-    <!-- Discreet Error Toast when player.errorMessage exists -->
-    <div
-      v-if="player.errorMessage"
-      class="pointer-events-auto flex items-center justify-between gap-3 px-4 py-2 rounded-2xl bg-rose-950/95 border border-rose-500/40 text-rose-100 text-xs shadow-xl backdrop-blur-md max-w-xl w-full"
-    >
-      <div class="flex items-center gap-2 min-w-0">
-        <AlertCircle class="w-4 h-4 text-rose-400 shrink-0" />
-        <span class="truncate">{{ player.errorMessage }}</span>
-      </div>
-      <button
-        type="button"
-        @click="player.dismissError()"
-        class="p-1 rounded-full hover:bg-white/10 text-rose-200 transition-colors shrink-0"
-      >
-        <X class="w-3.5 h-3.5" />
-      </button>
-    </div>
-
     <!-- Floating Dark Pill Player ("Player do C") -->
     <footer
       class="pointer-events-auto relative w-full rounded-[28px] bg-[#231E36]/95 dark:bg-[#1D182E]/95 backdrop-blur-xl border border-white/10 shadow-[0_14px_40px_rgba(18,16,27,0.45)] px-4 sm:px-5 pt-2.5 pb-3.5 text-white overflow-hidden"
