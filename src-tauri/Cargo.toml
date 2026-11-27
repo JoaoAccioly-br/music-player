@@ -1,6 +1,6 @@
 [package]
 name = "youtube-music-rust"
-version = "0.1.1"
+version = "0.1.2"
 description = "Ultra-lightweight YouTube Music desktop client in Rust and Tauri v2 (Zero-WebView Background Mode)"
 authors = ["Joao Accioly"]
 edition = "2021"
