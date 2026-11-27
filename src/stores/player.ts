@@ -365,7 +365,7 @@ export const usePlayerStore = defineStore('player', () => {
   const positionSecs = ref(0)
   const durationSecs = ref(initialTrack.duration_secs)
   const isLoading = ref(false)
-  const audioQualityLabel = ref('Opus 160kbps • RAM')
+  const audioQualityLabel = ref('M4A/AAC • RAM')
   const bufferSizeMb = ref(0)
   const repeatMode = ref<RepeatMode>('off')
   const autoplayRadio = ref(true)
@@ -414,11 +414,13 @@ export const usePlayerStore = defineStore('player', () => {
   const userPlaylists = shallowRef<PlaylistItem[]>([...FALLBACK_PLAYLISTS])
   const selectedPlaylistTracks = shallowRef<TrackItem[]>([])
   const selectedPlaylistTitle = ref<string>('')
-  const isFetchingContent = ref(false)
+  const activeContentRequests = ref(0)
+  const isFetchingContent = computed(() => activeContentRequests.value > 0)
 
   let unlistenPlayerFn: UnlistenFn | null = null
   let unlistenAuthFn: UnlistenFn | null = null
   let unlistenQueueFn: UnlistenFn | null = null
+  let initPromise: Promise<void> | null = null
 
   function applyRustState(state: RustPlayerState) {
     const previousVideoId = videoId.value
@@ -448,50 +450,64 @@ export const usePlayerStore = defineStore('player', () => {
     }
   }
 
-  async function initStore() {
-    applyThemeToDom(theme.value)
-    try {
-      const state = await invoke<RustPlayerState>('get_player_state')
-      applyRustState(state)
-      isTauriConnected.value = true
+  function initStore(): Promise<void> {
+    if (initPromise) return initPromise
+    initPromise = (async () => {
+      applyThemeToDom(theme.value)
 
-      const status = await invoke<AuthStatus>('get_auth_status')
-      authStatus.value = status
+      // Register listeners BEFORE fetching initial snapshots so events arriving
+      // during bootstrap/WebView reopen are never missed.
+      try {
+        if (!unlistenPlayerFn) {
+          unlistenPlayerFn = await listen<RustPlayerState>('player-state-changed', (event) => {
+            applyRustState(event.payload)
+          })
+        }
+
+        if (!unlistenQueueFn) {
+          unlistenQueueFn = await listen<TrackItem[]>('queue-changed', (event) => {
+            queue.value = event.payload
+            queueLen.value = event.payload.length
+          })
+        }
+
+        if (!unlistenAuthFn) {
+          unlistenAuthFn = await listen<AuthStatus>('auth-state-changed', (event) => {
+            authStatus.value = event.payload
+            authError.value = null
+            loadHomeFeed()
+            loadLikedMusic()
+            loadUserPlaylists()
+          })
+        }
+
+        const state = await invoke<RustPlayerState>('get_player_state')
+        applyRustState(state)
+        isTauriConnected.value = true
+      } catch {
+        // Browser preview fallback outside Tauri runtime
+        cleanupStore()
+        isTauriConnected.value = false
+        lastSyncTimestamp.value = new Date().toLocaleTimeString()
+        refreshRelatedTracks()
+        return
+      }
+
+      // Secondary bootstrap calls — errors here must NOT downgrade isTauriConnected
+      try {
+        const status = await invoke<AuthStatus>('get_auth_status')
+        authStatus.value = status
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
 
       await fetchQueue()
+      await Promise.all([loadHomeFeed(), loadLikedMusic(), loadUserPlaylists()])
+    })().finally(() => {
+      initPromise = null
+    })
 
-      if (!unlistenPlayerFn) {
-        unlistenPlayerFn = await listen<RustPlayerState>('player-state-changed', (event) => {
-          applyRustState(event.payload)
-        })
-      }
-
-      if (!unlistenQueueFn) {
-        unlistenQueueFn = await listen<TrackItem[]>('queue-changed', (event) => {
-          queue.value = event.payload
-          queueLen.value = event.payload.length
-        })
-      }
-
-      if (!unlistenAuthFn) {
-        unlistenAuthFn = await listen<AuthStatus>('auth-state-changed', (event) => {
-          authStatus.value = event.payload
-          authError.value = null
-          loadHomeFeed()
-          loadLikedMusic()
-          loadUserPlaylists()
-        })
-      }
-
-      await loadHomeFeed()
-      await loadLikedMusic()
-      loadUserPlaylists()
-    } catch {
-      // Browser preview fallback outside Tauri runtime
-      isTauriConnected.value = false
-      lastSyncTimestamp.value = new Date().toLocaleTimeString()
-      refreshRelatedTracks()
-    }
+    return initPromise
   }
 
   async function fetchQueue() {
@@ -508,11 +524,25 @@ export const usePlayerStore = defineStore('player', () => {
   }
 
   let latestLyricsRequestId = 0
-  async function fetchLyrics(forceVideoId?: string, forceTitle?: string, forceArtist?: string) {
+  async function fetchLyrics(
+    forceVideoId?: string,
+    forceTitle?: string,
+    forceArtist?: string,
+    force = false
+  ) {
     const targetVideoId = (forceVideoId ?? videoId.value).trim()
     const targetTitle = (forceTitle ?? currentTrackTitle.value).trim()
     const targetArtist = (forceArtist ?? currentTrackArtist.value).trim()
     if (!targetVideoId && !targetTitle) return
+
+    if (
+      !force &&
+      targetVideoId &&
+      lyrics.value?.videoId === targetVideoId &&
+      !isLoadingLyrics.value
+    ) {
+      return
+    }
 
     const requestId = ++latestLyricsRequestId
     isLoadingLyrics.value = true
@@ -637,8 +667,12 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function playQueueIndex(index: number) {
     if (isTauriConnected.value) {
-      const state = await invoke<RustPlayerState>('play_queue_index', { index })
-      applyRustState(state)
+      try {
+        const state = await invoke<RustPlayerState>('play_queue_index', { index })
+        applyRustState(state)
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     } else {
       const chosen = queue.value[index]
       if (!chosen) return
@@ -655,9 +689,13 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function removeFromQueue(index: number) {
     if (isTauriConnected.value) {
-      const updated = await invoke<TrackItem[]>('remove_from_queue', { index })
-      queue.value = updated
-      queueLen.value = updated.length
+      try {
+        const updated = await invoke<TrackItem[]>('remove_from_queue', { index })
+        queue.value = updated
+        queueLen.value = updated.length
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     } else if (queue.value.length > 1) {
       const newQ = [...queue.value]
       newQ.splice(index, 1)
@@ -671,9 +709,13 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function clearQueue() {
     if (isTauriConnected.value) {
-      const updated = await invoke<TrackItem[]>('clear_queue')
-      queue.value = updated
-      queueLen.value = updated.length
+      try {
+        const updated = await invoke<TrackItem[]>('clear_queue')
+        queue.value = updated
+        queueLen.value = updated.length
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     } else {
       const current = queue.value[queueIndex.value]
       if (current) {
@@ -686,9 +728,13 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function shuffleQueue() {
     if (isTauriConnected.value) {
-      const updated = await invoke<TrackItem[]>('shuffle_queue')
-      queue.value = updated
-      queueLen.value = updated.length
+      try {
+        const updated = await invoke<TrackItem[]>('shuffle_queue')
+        queue.value = updated
+        queueLen.value = updated.length
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     } else if (queue.value.length > 1) {
       const current = queue.value[queueIndex.value] ?? queue.value[0]
       const rest = queue.value.filter((_, idx) => idx !== queueIndex.value)
@@ -706,8 +752,12 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function cycleRepeatMode() {
     if (isTauriConnected.value) {
-      const state = await invoke<RustPlayerState>('cycle_repeat_mode')
-      applyRustState(state)
+      try {
+        const state = await invoke<RustPlayerState>('cycle_repeat_mode')
+        applyRustState(state)
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     } else {
       repeatMode.value =
         repeatMode.value === 'off' ? 'all' : repeatMode.value === 'all' ? 'one' : 'off'
@@ -716,8 +766,12 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function toggleAutoplayRadio() {
     if (isTauriConnected.value) {
-      const state = await invoke<RustPlayerState>('toggle_autoplay_radio')
-      applyRustState(state)
+      try {
+        const state = await invoke<RustPlayerState>('toggle_autoplay_radio')
+        applyRustState(state)
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     } else {
       autoplayRadio.value = !autoplayRadio.value
     }
@@ -725,8 +779,12 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function toggleLowRamImages() {
     if (isTauriConnected.value) {
-      const state = await invoke<RustPlayerState>('toggle_low_ram_images')
-      applyRustState(state)
+      try {
+        const state = await invoke<RustPlayerState>('toggle_low_ram_images')
+        applyRustState(state)
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     } else {
       lowRamNoImages.value = !lowRamNoImages.value
     }
@@ -857,8 +915,16 @@ export const usePlayerStore = defineStore('player', () => {
     await playTrackList(unique.slice(0, 12), 0)
   }
 
-  function dismissError() {
+  async function dismissError() {
     errorMessage.value = null
+    if (isTauriConnected.value) {
+      try {
+        const state = await invoke<RustPlayerState>('clear_error')
+        applyRustState(state)
+      } catch {
+        // Already cleared locally
+      }
+    }
   }
 
   async function openLoginWindow() {
@@ -877,7 +943,7 @@ export const usePlayerStore = defineStore('player', () => {
     try {
       const status = await invoke<AuthStatus>('set_manual_cookie', { cookieStr })
       authStatus.value = status
-      await loadHomeFeed()
+      // Backend emits `auth-state-changed` which triggers feed/library refresh
       return true
     } catch (err) {
       authError.value = String(err)
@@ -888,16 +954,19 @@ export const usePlayerStore = defineStore('player', () => {
   async function logout() {
     authError.value = null
     if (!isTauriConnected.value) return
-    const status = await invoke<AuthStatus>('logout_auth')
-    authStatus.value = status
-    await loadHomeFeed()
-    await loadLikedMusic()
-    await loadUserPlaylists()
+    try {
+      const status = await invoke<AuthStatus>('logout_auth')
+      authStatus.value = status
+      // Backend emits `auth-state-changed` which triggers feed/library refresh
+    } catch (err) {
+      authError.value = String(err)
+      errorMessage.value = String(err)
+    }
   }
 
   async function loadHomeFeed() {
     if (!isTauriConnected.value) return
-    isFetchingContent.value = true
+    activeContentRequests.value += 1
     try {
       const sections = await invoke<HomeSection[]>('get_home_feed')
       if (sections && sections.length > 0) {
@@ -918,7 +987,7 @@ export const usePlayerStore = defineStore('player', () => {
     } catch (err) {
       errorMessage.value = String(err)
     } finally {
-      isFetchingContent.value = false
+      activeContentRequests.value = Math.max(0, activeContentRequests.value - 1)
     }
   }
 
@@ -936,20 +1005,25 @@ export const usePlayerStore = defineStore('player', () => {
       )
       return matches.length > 0 ? matches : all
     }
-    return await invoke<TrackItem[]>('search_youtube_music', {
-      query: trimmed,
-      filter: filter ?? 'all',
-    })
+    try {
+      return await invoke<TrackItem[]>('search_youtube_music', {
+        query: trimmed,
+        filter: filter ?? 'all',
+      })
+    } catch (err) {
+      errorMessage.value = String(err)
+      return []
+    }
   }
 
   async function loadExploreFeed(query = 'Novos lançamentos música') {
-    isFetchingContent.value = true
+    activeContentRequests.value += 1
     try {
       exploreResults.value = await queryTracks(query, 'all')
     } catch (err) {
       errorMessage.value = String(err)
     } finally {
-      isFetchingContent.value = false
+      activeContentRequests.value = Math.max(0, activeContentRequests.value - 1)
     }
   }
 
@@ -959,20 +1033,20 @@ export const usePlayerStore = defineStore('player', () => {
     if (filterOverride) {
       searchFilter.value = filterOverride
     }
-    isFetchingContent.value = true
+    activeContentRequests.value += 1
     try {
       searchResults.value = await queryTracks(trimmed, searchFilter.value)
       refreshRelatedTracks()
     } catch (err) {
       errorMessage.value = String(err)
     } finally {
-      isFetchingContent.value = false
+      activeContentRequests.value = Math.max(0, activeContentRequests.value - 1)
     }
   }
 
   async function loadLikedMusic() {
     if (!isTauriConnected.value) return
-    isFetchingContent.value = true
+    activeContentRequests.value += 1
     try {
       const items = await invoke<TrackItem[]>('get_liked_music')
       if (Array.isArray(items)) {
@@ -981,13 +1055,13 @@ export const usePlayerStore = defineStore('player', () => {
     } catch (err) {
       errorMessage.value = String(err)
     } finally {
-      isFetchingContent.value = false
+      activeContentRequests.value = Math.max(0, activeContentRequests.value - 1)
     }
   }
 
   async function loadUserPlaylists() {
     if (!isTauriConnected.value) return
-    isFetchingContent.value = true
+    activeContentRequests.value += 1
     try {
       const lists = await invoke<PlaylistItem[]>('get_user_playlists')
       if (lists && lists.length > 0) {
@@ -996,7 +1070,7 @@ export const usePlayerStore = defineStore('player', () => {
     } catch (err) {
       errorMessage.value = String(err)
     } finally {
-      isFetchingContent.value = false
+      activeContentRequests.value = Math.max(0, activeContentRequests.value - 1)
     }
   }
 
@@ -1006,7 +1080,7 @@ export const usePlayerStore = defineStore('player', () => {
       selectedPlaylistTracks.value = homeSections.value.flatMap((s) => s.items)
       return
     }
-    isFetchingContent.value = true
+    activeContentRequests.value += 1
     try {
       selectedPlaylistTracks.value = await invoke<TrackItem[]>('get_playlist_tracks', {
         playlistId: playlist.playlist_id,
@@ -1014,18 +1088,22 @@ export const usePlayerStore = defineStore('player', () => {
     } catch (err) {
       errorMessage.value = String(err)
     } finally {
-      isFetchingContent.value = false
+      activeContentRequests.value = Math.max(0, activeContentRequests.value - 1)
     }
   }
 
   async function playTrackList(tracks: TrackItem[], startIndex: number) {
     if (!tracks.length) return
     if (isTauriConnected.value) {
-      const state = await invoke<RustPlayerState>('play_track_list', {
-        tracks,
-        startIndex,
-      })
-      applyRustState(state)
+      try {
+        const state = await invoke<RustPlayerState>('play_track_list', {
+          tracks,
+          startIndex,
+        })
+        applyRustState(state)
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     } else {
       queue.value = [...tracks]
       queueLen.value = tracks.length
@@ -1043,8 +1121,12 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function togglePlay() {
     if (isTauriConnected.value) {
-      const state = await invoke<RustPlayerState>('toggle_play')
-      applyRustState(state)
+      try {
+        const state = await invoke<RustPlayerState>('toggle_play')
+        applyRustState(state)
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     } else {
       isPlaying.value = !isPlaying.value
     }
@@ -1052,8 +1134,12 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function nextTrack() {
     if (isTauriConnected.value) {
-      const state = await invoke<RustPlayerState>('next_track')
-      applyRustState(state)
+      try {
+        const state = await invoke<RustPlayerState>('next_track')
+        applyRustState(state)
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     } else if (queue.value.length > 0) {
       queueIndex.value = (queueIndex.value + 1) % queue.value.length
       const next = queue.value[queueIndex.value]
@@ -1069,8 +1155,12 @@ export const usePlayerStore = defineStore('player', () => {
 
   async function prevTrack() {
     if (isTauriConnected.value) {
-      const state = await invoke<RustPlayerState>('prev_track')
-      applyRustState(state)
+      try {
+        const state = await invoke<RustPlayerState>('prev_track')
+        applyRustState(state)
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     } else if (queue.value.length > 0) {
       queueIndex.value = (queueIndex.value + queue.value.length - 1) % queue.value.length
       const prev = queue.value[queueIndex.value]
@@ -1088,8 +1178,12 @@ export const usePlayerStore = defineStore('player', () => {
     const clamped = Math.max(0, Math.min(1, newVolume))
     volume.value = clamped
     if (isTauriConnected.value) {
-      const state = await invoke<RustPlayerState>('set_volume', { volume: clamped })
-      applyRustState(state)
+      try {
+        const state = await invoke<RustPlayerState>('set_volume', { volume: clamped })
+        applyRustState(state)
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     }
   }
 
@@ -1097,8 +1191,12 @@ export const usePlayerStore = defineStore('player', () => {
     const clamped = Math.max(0, Math.min(durationSecs.value || 1, seconds))
     positionSecs.value = clamped
     if (isTauriConnected.value) {
-      const state = await invoke<RustPlayerState>('seek_to', { positionSecs: clamped })
-      applyRustState(state)
+      try {
+        const state = await invoke<RustPlayerState>('seek_to', { positionSecs: clamped })
+        applyRustState(state)
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     }
   }
 
@@ -1106,12 +1204,16 @@ export const usePlayerStore = defineStore('player', () => {
     const trimmed = urlOrId.trim()
     if (!trimmed) return
     if (isTauriConnected.value) {
-      const state = await invoke<RustPlayerState>('play_youtube_video', {
-        videoId: trimmed,
-        title: title ?? null,
-        artist: artist ?? null,
-      })
-      applyRustState(state)
+      try {
+        const state = await invoke<RustPlayerState>('play_youtube_video', {
+          videoId: trimmed,
+          title: title ?? null,
+          artist: artist ?? null,
+        })
+        applyRustState(state)
+      } catch (err) {
+        errorMessage.value = String(err)
+      }
     } else {
       videoId.value = trimmed
       currentTrackTitle.value = title || `YouTube Stream (${trimmed})`

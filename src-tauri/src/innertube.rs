@@ -9,6 +9,8 @@ const YTM_API_BASE: &str = "https://music.youtube.com/youtubei/v1";
 const WEB_REMIX_CLIENT_NAME: &str = "WEB_REMIX";
 const WEB_REMIX_CLIENT_VERSION: &str = "1.20250101.01.00";
 const WEB_REMIX_CLIENT_ID: &str = "67";
+const MAX_INNERTUBE_JSON_BYTES: usize = 5 * 1024 * 1024;
+const MAX_LRCLIB_JSON_BYTES: usize = 1024 * 1024;
 
 static SHARED_HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -25,6 +27,42 @@ pub fn get_shared_http_client() -> reqwest::Client {
                 .expect("Falha ao inicializar pool HTTP compartilhado")
         })
         .clone()
+}
+
+/// Reads and parses a JSON response body while enforcing an upper byte limit to prevent
+/// unbounded RAM allocation from oversized or malicious responses.
+pub(crate) async fn read_json_bounded(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Value, String> {
+    if let Some(content_len) = resp.content_length() {
+        if content_len > max_bytes as u64 {
+            return Err(format!(
+                "Resposta JSON excedeu o limite seguro de {max_bytes} bytes ({content_len} bytes)"
+            ));
+        }
+    }
+
+    let initial_cap = resp
+        .content_length()
+        .map(|n| (n as usize).min(max_bytes))
+        .unwrap_or(16 * 1024);
+    let mut buf = Vec::with_capacity(initial_cap);
+
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("Erro ao ler corpo JSON da resposta: {e}"))?
+    {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!(
+                "Resposta JSON excedeu o limite seguro de {max_bytes} bytes"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice::<Value>(&buf).map_err(|e| format!("Falha ao decodificar JSON: {e}"))
 }
 
 /// Validates identifier tokens like videoId or playlistId to contain only safe alphanumeric and hyphen/underscore characters.
@@ -158,7 +196,7 @@ impl InnertubeClient {
             ));
         }
 
-        resp.json::<Value>()
+        read_json_bounded(resp, MAX_INNERTUBE_JSON_BYTES)
             .await
             .map_err(|e| format!("Falha ao decodificar JSON do Innertube ({endpoint}): {e}"))
     }
@@ -212,12 +250,9 @@ pub async fn search_music_filtered(
     filter: Option<&str>,
     auth: Option<&AuthSession>,
 ) -> Result<Vec<TrackItem>, String> {
-    let mut trimmed = query.trim();
+    let trimmed: String = query.trim().chars().take(200).collect();
     if trimmed.is_empty() {
         return Ok(Vec::new());
-    }
-    if trimmed.len() > 200 {
-        trimmed = &trimmed[..200];
     }
 
     let client = InnertubeClient::new()?;
@@ -225,7 +260,7 @@ pub async fn search_music_filtered(
     // 1. If a specific filter parameter is requested, try filtered search first
     if let Some(params) = resolve_search_filter_params(filter) {
         let filtered_payload = json!({
-            "query": trimmed,
+            "query": trimmed.as_str(),
             "params": params
         });
 
@@ -241,7 +276,7 @@ pub async fn search_music_filtered(
 
     // 2. Unfiltered search (or automatic fallback if filtered search returned empty)
     let payload = json!({
-        "query": trimmed
+        "query": trimmed.as_str()
     });
 
     if let Ok(data) = client.post_endpoint("search", payload, auth).await {
@@ -310,7 +345,11 @@ pub async fn set_track_like_status(
         return Err("Identificador de faixa inválido.".to_string());
     }
 
-    let endpoint = if liked { "like/like" } else { "like/removelike" };
+    let endpoint = if liked {
+        "like/like"
+    } else {
+        "like/removelike"
+    };
     let client = InnertubeClient::new()?;
     let payload = json!({
         "target": {
@@ -643,7 +682,10 @@ fn sanitize_track_title_for_lyrics(title: &str) -> String {
         "[HD]",
         "[4K]",
     ] {
-        if let Some(idx) = cleaned.to_lowercase().find(&marker.to_lowercase()) {
+        if let Some(idx) = cleaned
+            .to_ascii_lowercase()
+            .find(&marker.to_ascii_lowercase())
+        {
             cleaned.replace_range(idx..idx + marker.len(), "");
         }
     }
@@ -656,11 +698,7 @@ async fn fetch_lrclib_lyrics(
     artist: &str,
 ) -> Option<(Vec<TimedLyricLine>, bool)> {
     let cleaned_title = sanitize_track_title_for_lyrics(title);
-    let clean_artist = artist
-        .split([',', '&'])
-        .next()
-        .unwrap_or(artist)
-        .trim();
+    let clean_artist = artist.split([',', '&']).next().unwrap_or(artist).trim();
     let has_valid_artist = !clean_artist.is_empty()
         && !clean_artist.eq_ignore_ascii_case("YouTube Music")
         && !clean_artist.eq_ignore_ascii_case("YouTube Music Radio");
@@ -676,12 +714,15 @@ async fn fetch_lrclib_lyrics(
             if let Ok(resp) = http
                 .get("https://lrclib.net/api/get")
                 .header("User-Agent", FIREFOX_LINUX_UA)
-                .query(&[("artist_name", clean_artist), ("track_name", candidate_title)])
+                .query(&[
+                    ("artist_name", clean_artist),
+                    ("track_name", candidate_title),
+                ])
                 .send()
                 .await
             {
                 if resp.status().is_success() {
-                    if let Ok(json_val) = resp.json::<Value>().await {
+                    if let Ok(json_val) = read_json_bounded(resp, MAX_LRCLIB_JSON_BYTES).await {
                         if let Some((lines, is_synced)) = parse_lrclib_record(&json_val) {
                             if is_synced {
                                 return Some((lines, true));
@@ -714,7 +755,7 @@ async fn fetch_lrclib_lyrics(
         .await
     {
         if resp.status().is_success() {
-            if let Ok(Value::Array(items)) = resp.json::<Value>().await {
+            if let Ok(Value::Array(items)) = read_json_bounded(resp, MAX_LRCLIB_JSON_BYTES).await {
                 for item in &items {
                     if let Some((lines, is_synced)) = parse_lrclib_record(item) {
                         if is_synced {
@@ -864,8 +905,8 @@ mod lyrics_tests {
 [ti:Nightcall]
 [00:10.50] I'm giving you a night call
 [00:15.20][01:20.00] To tell you how I feel
-[00:22.00] 
-[01:25.00] 
+[00:22.00]
+[01:25.00]
 ";
         let parsed = parse_lrc_lyrics(sample);
         assert_eq!(parsed.len(), 4);
@@ -1040,15 +1081,8 @@ fn parse_playlist_panel_video_track(renderer: &Value) -> Option<TrackItem> {
 
     let duration_secs = parse_duration_secs(&duration_text).unwrap_or(210.0);
 
-    let thumbnail_url = extract_best_thumbnail(renderer)
-        .or_else(|| {
-            renderer
-                .pointer("/thumbnail/thumbnails/0/url")
-                .and_then(|v| v.as_str())
-                .filter(|u| u.starts_with("https://"))
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"));
+    let thumbnail_url =
+        extract_best_thumbnail(renderer).unwrap_or_else(|| fallback_ytimg_thumbnail(&video_id));
 
     Some(TrackItem {
         video_id,
@@ -1137,8 +1171,8 @@ fn parse_responsive_list_item_track(renderer: &Value) -> Option<TrackItem> {
     }
     let duration_secs = parse_duration_secs(&duration_text).unwrap_or(210.0);
 
-    let thumbnail_url = extract_best_thumbnail(renderer)
-        .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"));
+    let thumbnail_url =
+        extract_best_thumbnail(renderer).unwrap_or_else(|| fallback_ytimg_thumbnail(&video_id));
 
     Some(TrackItem {
         video_id,
@@ -1222,8 +1256,8 @@ fn try_parse_two_row_track(renderer: &Value) -> Option<TrackItem> {
         ("3:30".to_string(), 210.0)
     };
 
-    let thumbnail_url = extract_best_thumbnail(renderer)
-        .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"));
+    let thumbnail_url =
+        extract_best_thumbnail(renderer).unwrap_or_else(|| fallback_ytimg_thumbnail(&video_id));
 
     Some(TrackItem {
         video_id,
@@ -1405,6 +1439,71 @@ fn find_first_string_key(node: &Value, target_key: &str) -> Option<String> {
     }
 }
 
+fn is_trusted_thumbnail_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    host == "www.gstatic.com"
+        || host == "ytimg.com"
+        || host.ends_with(".ytimg.com")
+        || host == "ggpht.com"
+        || host.ends_with(".ggpht.com")
+        || host == "googleusercontent.com"
+        || host.ends_with(".googleusercontent.com")
+}
+
+fn normalize_thumbnail_url(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return url.to_string();
+    };
+    let host = parsed.host_str().unwrap_or("");
+    let is_google_resize_host = host == "lh3.googleusercontent.com"
+        || host == "yt3.ggpht.com"
+        || host.ends_with(".googleusercontent.com")
+        || host.ends_with(".ggpht.com");
+    if !is_google_resize_host {
+        return url.to_string();
+    }
+
+    let last_slash = url.rfind('/').unwrap_or(0);
+    let tail = &url[last_slash..];
+    if let Some(rel_eq) = tail.find("=w") {
+        let abs_eq = last_slash + rel_eq;
+        let after_w = &url[abs_eq + 2..];
+        let w_digits: String = after_w.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !w_digits.is_empty() {
+            let after_w_digits = &after_w[w_digits.len()..];
+            if let Some(after_h) = after_w_digits.strip_prefix("-h") {
+                let h_digits: String = after_h.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if !h_digits.is_empty() {
+                    let w: u64 = w_digits.parse().unwrap_or(0);
+                    let h: u64 = h_digits.parse().unwrap_or(0);
+                    if w > 320 || h > 320 {
+                        return format!("{}=w226-h226-l90-rj", &url[..abs_eq]);
+                    }
+                }
+            }
+        }
+    }
+
+    url.to_string()
+}
+
+fn fallback_ytimg_thumbnail(video_id: &str) -> String {
+    let trimmed = video_id.trim();
+    if is_valid_identifier(trimmed, 32) {
+        format!("https://i.ytimg.com/vi/{trimmed}/hqdefault.jpg")
+    } else {
+        String::new()
+    }
+}
+
 fn extract_best_thumbnail(node: &Value) -> Option<String> {
     let pointers = [
         "/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails",
@@ -1413,14 +1512,42 @@ fn extract_best_thumbnail(node: &Value) -> Option<String> {
     ];
     for ptr in pointers {
         if let Some(arr) = node.pointer(ptr).and_then(|v| v.as_array()) {
-            if let Some(url) = arr
-                .last()
-                .and_then(|item| item.get("url"))
-                .and_then(|u| u.as_str())
+            let candidates: Vec<(&str, Option<u64>)> = arr
+                .iter()
+                .filter_map(|item| {
+                    let url = item.get("url").and_then(|u| u.as_str())?;
+                    if !is_trusted_thumbnail_url(url) {
+                        return None;
+                    }
+                    let width = item.get("width").and_then(|w| w.as_u64());
+                    Some((url, width))
+                })
+                .collect();
+
+            if candidates.is_empty() {
+                continue;
+            }
+
+            // 1. Prefer the first medium-resolution thumbnail (180px..=320px) to keep WebView texture RAM low
+            if let Some((url, _)) = candidates
+                .iter()
+                .find(|(_, w)| w.is_some_and(|px| (180..=320).contains(&px)))
             {
-                if url.starts_with("https://") {
-                    return Some(url.to_string());
-                }
+                return Some(normalize_thumbnail_url(url));
+            }
+
+            // 2. Otherwise pick the candidate whose width is closest to 226px
+            if let Some((url, _)) = candidates
+                .iter()
+                .filter_map(|(u, w)| w.map(|px| (*u, px.abs_diff(226))))
+                .min_by_key(|(_, diff)| *diff)
+            {
+                return Some(normalize_thumbnail_url(url));
+            }
+
+            // 3. If no width metadata is present, fall back to the last valid thumbnail
+            if let Some((url, _)) = candidates.last() {
+                return Some(normalize_thumbnail_url(url));
             }
         }
     }
@@ -1643,9 +1770,9 @@ mod tests {
 [1:2:3:4] Too many colons
 [00:30.00] Second chronologically
 [00:15.00] First chronologically
-[00:20.00]   
+[00:20.00]
 [00:40.00]
-[00:45.00]   
+[00:45.00]
 ";
         let parsed = parse_lrc_lyrics(lrc);
         // Trailing empty "♪" lines at 40s and 45s are stripped; middle "♪" at 20s is preserved
@@ -1680,12 +1807,70 @@ mod tests {
             sanitize_track_title_for_lyrics("Midnight City (Eric Prydz Remix)"),
             "Midnight City (Eric Prydz Remix)"
         );
+        // Multi-byte Unicode characters (e.g. Turkish İ which expands under Unicode to_lowercase) must not panic
+        assert_eq!(
+            sanitize_track_title_for_lyrics("İstanbul Nights (Official Video)"),
+            "İstanbul Nights"
+        );
+    }
+
+    #[test]
+    fn test_thumbnail_selection_normalization_and_validation() {
+        // Medium resolution (180..=320) is preferred over tiny (60) and huge (1200)
+        let node = json!({
+            "thumbnail": {
+                "thumbnails": [
+                    { "url": "https://lh3.googleusercontent.com/a=w60-h60-l90-rj", "width": 60 },
+                    { "url": "https://lh3.googleusercontent.com/a=w226-h226-l90-rj", "width": 226 },
+                    { "url": "https://lh3.googleusercontent.com/a=w1200-h1200-l90-rj", "width": 1200 }
+                ]
+            }
+        });
+        assert_eq!(
+            extract_best_thumbnail(&node).as_deref(),
+            Some("https://lh3.googleusercontent.com/a=w226-h226-l90-rj")
+        );
+
+        // Oversized Google thumbnail gets normalized down to =w226-h226-l90-rj
+        let oversized = json!({
+            "thumbnail": {
+                "thumbnails": [
+                    { "url": "https://lh3.googleusercontent.com/b=w544-h544-l90-rj", "width": 544 },
+                    { "url": "https://yt3.ggpht.com/b=w1200-h1200-p-l90-rj", "width": 1200 }
+                ]
+            }
+        });
+        assert_eq!(
+            extract_best_thumbnail(&oversized).as_deref(),
+            Some("https://lh3.googleusercontent.com/b=w226-h226-l90-rj")
+        );
+
+        // Untrusted or HTTP URLs are rejected
+        let untrusted = json!({
+            "thumbnail": {
+                "thumbnails": [
+                    { "url": "http://lh3.googleusercontent.com/x=w226-h226", "width": 226 },
+                    { "url": "https://evil.example.com/thumb.jpg", "width": 226 }
+                ]
+            }
+        });
+        assert_eq!(extract_best_thumbnail(&untrusted), None);
+
+        // Fallback ytimg URL validates video_id before interpolation
+        assert_eq!(
+            fallback_ytimg_thumbnail("MV_3Dpw-BRY"),
+            "https://i.ytimg.com/vi/MV_3Dpw-BRY/hqdefault.jpg"
+        );
+        assert_eq!(fallback_ytimg_thumbnail("../evil/path"), "");
     }
 
     #[test]
     fn test_is_valid_identifier() {
         assert!(is_valid_identifier("MV_3Dpw-BRY", 32));
-        assert!(is_valid_identifier("VLPL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i", 64));
+        assert!(is_valid_identifier(
+            "VLPL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i",
+            64
+        ));
         assert!(!is_valid_identifier("", 32));
         assert!(!is_valid_identifier("abcde", 4));
         assert!(is_valid_identifier("abcd", 4));
@@ -1739,9 +1924,9 @@ mod tests {
         // Synced lyrics take precedence over plainLyrics
         let synced_record = json!({
             "syncedLyrics": "[00:05.00] Synced line 1
-[00:10.00] Synced line 2",
+        [00:10.00] Synced line 2",
             "plainLyrics": "Plain line 1
-Plain line 2"
+        Plain line 2"
         });
         let (lines, is_synced) = parse_lrclib_record(&synced_record).unwrap();
         assert!(is_synced);
@@ -1752,9 +1937,9 @@ Plain line 2"
         // Falls back to plainLyrics if syncedLyrics yields no valid timestamps
         let fallback_record = json!({
             "syncedLyrics": "[ar:Only Metadata]",
-            "plainLyrics": "  First plain line 
+            "plainLyrics": "  First plain line
 
-  Second plain line  
+  Second plain line
 "
         });
         let (plain_lines, is_synced_fb) = parse_lrclib_record(&fallback_record).unwrap();
@@ -1767,8 +1952,8 @@ Plain line 2"
         // Empty / missing lyrics returns None
         let empty_record = json!({
             "syncedLyrics": "",
-            "plainLyrics": "   
-  "
+            "plainLyrics": "
+        "
         });
         assert!(parse_lrclib_record(&empty_record).is_none());
         assert!(parse_lrclib_record(&json!({})).is_none());

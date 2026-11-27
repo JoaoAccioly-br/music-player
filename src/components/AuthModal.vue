@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { CheckCircle2, ExternalLink, KeyRound, LogOut, ShieldCheck, X } from 'lucide-vue-next'
 import { usePlayerStore } from '../stores/player'
@@ -16,6 +16,7 @@ const player = usePlayerStore()
 const manualCookieInput = ref('')
 const manualCookieSuccess = ref(false)
 const authFilePath = ref('~/.local/share/com.ytmusic.rust/auth.json')
+let closeTimer: ReturnType<typeof setTimeout> | null = null
 
 async function refreshAuthFilePath() {
   if (!player.isTauriConnected) return
@@ -31,6 +32,13 @@ async function refreshAuthFilePath() {
 
 onMounted(() => {
   refreshAuthFilePath()
+})
+
+onUnmounted(() => {
+  if (closeTimer) {
+    clearTimeout(closeTimer)
+    closeTimer = null
+  }
 })
 
 watch(
@@ -49,7 +57,9 @@ async function handleSaveManualCookie() {
   if (ok) {
     manualCookieInput.value = ''
     manualCookieSuccess.value = true
-    setTimeout(() => {
+    if (closeTimer) clearTimeout(closeTimer)
+    closeTimer = setTimeout(() => {
+      closeTimer = null
       manualCookieSuccess.value = false
       emit('close')
     }, 900)

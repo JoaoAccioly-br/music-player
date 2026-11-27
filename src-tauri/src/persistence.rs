@@ -3,6 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const MAX_PERSISTED_QUEUE: usize = 300;
+
+static PERSIST_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static PERSIST_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Lightweight player session persisted to `<app_data_dir>/player_session.json`
 /// with strict `0600` file permissions on Unix.
@@ -110,7 +118,6 @@ pub fn get_session_file_path() -> PathBuf {
     get_app_data_dir().join("player_session.json")
 }
 
-/// Loads the persisted player session from `<app_data_dir>/player_session.json` if present and valid.
 /// Normalizes and clamps persisted session fields to valid bounds and defaults.
 pub fn normalize_persisted_session(mut session: PersistedSession) -> PersistedSession {
     session.volume = session.volume.clamp(0.0, 1.0);
@@ -126,6 +133,20 @@ pub fn normalize_persisted_session(mut session: PersistedSession) -> PersistedSe
     if !session.queue.is_empty() && session.queue_index >= session.queue.len() {
         session.queue_index = 0;
     }
+    if session.queue.len() > MAX_PERSISTED_QUEUE {
+        let excess = session.queue.len() - MAX_PERSISTED_QUEUE;
+        let drain_from_front = excess.min(session.queue_index);
+        if drain_from_front > 0 {
+            session.queue.drain(0..drain_from_front);
+            session.queue_index -= drain_from_front;
+        }
+        if session.queue.len() > MAX_PERSISTED_QUEUE {
+            session.queue.truncate(MAX_PERSISTED_QUEUE);
+        }
+        if session.queue_index >= session.queue.len() {
+            session.queue_index = session.queue.len().saturating_sub(1);
+        }
+    }
     let mut seen_liked = HashSet::new();
     session.liked_tracks.retain(|track| {
         let vid = track.video_id.trim();
@@ -137,6 +158,7 @@ pub fn normalize_persisted_session(mut session: PersistedSession) -> PersistedSe
     session
 }
 
+/// Loads the persisted player session from `<app_data_dir>/player_session.json` if present and valid.
 pub fn load_persisted_session() -> Option<PersistedSession> {
     let path = get_session_file_path();
     let contents = fs::read_to_string(&path).ok()?;
@@ -144,45 +166,106 @@ pub fn load_persisted_session() -> Option<PersistedSession> {
     Some(normalize_persisted_session(session))
 }
 
-/// Saves `PersistedSession` to `<app_data_dir>/player_session.json` with `0700` directory
-/// and `0600` file permissions on Unix without TOCTOU race condition.
+/// Saves `PersistedSession` atomically and serialized to `<app_data_dir>/player_session.json`
+/// with `0700` directory and `0600` file permissions on Unix.
 pub fn save_persisted_session(session: &PersistedSession) {
-    let path = get_session_file_path();
-    if let Some(parent) = path.parent() {
-        if fs::create_dir_all(parent).is_err() {
-            return;
-        }
+    let _write_guard = PERSIST_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
-        }
+    let path = get_session_file_path();
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
     }
 
     let Ok(serialized) = serde_json::to_string(session) else {
         return;
     };
 
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Ok(mut file) = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
+    let seq = PERSIST_TMP_SEQ.fetch_add(1, Ordering::Relaxed) as u128;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        .wrapping_add(seq);
+    let tmp_path = parent.join(format!(
+        "player_session.{}.{}.tmp",
+        std::process::id(),
+        nanos
+    ));
+
+    let write_ok = {
+        #[cfg(unix)]
         {
-            let _ = file.write_all(serialized.as_bytes());
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp_path)
+            {
+                Ok(mut file) => {
+                    let perm_ok = file
+                        .set_permissions(fs::Permissions::from_mode(0o600))
+                        .is_ok();
+                    let data_ok =
+                        file.write_all(serialized.as_bytes()).is_ok() && file.sync_all().is_ok();
+                    perm_ok && data_ok
+                }
+                Err(_) => false,
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            match OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)
+            {
+                Ok(mut file) => {
+                    file.write_all(serialized.as_bytes()).is_ok() && file.sync_all().is_ok()
+                }
+                Err(_) => false,
+            }
+        }
+    };
+
+    if !write_ok {
+        let _ = fs::remove_file(&tmp_path);
+        return;
+    }
+
+    #[cfg(windows)]
+    {
+        if fs::rename(&tmp_path, &path).is_err() {
+            let _ = fs::remove_file(&path);
+            if fs::rename(&tmp_path, &path).is_err() {
+                let _ = fs::remove_file(&tmp_path);
+            }
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(windows))]
     {
-        let _ = fs::write(&path, serialized);
+        if fs::rename(&tmp_path, &path).is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
     }
 }
 
@@ -294,6 +377,23 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(empty_queue.queue_index, 4);
+    }
+
+    #[test]
+    fn test_normalize_persisted_session_caps_queue_preserving_active_track() {
+        let queue: Vec<TrackItem> = (0..350)
+            .map(|i| sample_track(&format!("vid{i:08}")))
+            .collect();
+        let active_id = queue[320].video_id.clone();
+
+        let normalized = normalize_persisted_session(PersistedSession {
+            queue,
+            queue_index: 320,
+            ..Default::default()
+        });
+        assert_eq!(normalized.queue.len(), MAX_PERSISTED_QUEUE);
+        assert_eq!(normalized.queue[normalized.queue_index].video_id, active_id);
+        assert_eq!(normalized.queue_index, 270);
     }
 
     #[test]

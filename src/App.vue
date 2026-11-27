@@ -277,9 +277,10 @@ const searchArtists = computed<Array<{ name: string; gradient: string }>>(() => 
   }))
 })
 
-const activeLyricIndex = computed(() =>
-  computeActiveLyricIndex(player.lyrics, player.positionSecs, player.durationSecs)
-)
+const activeLyricIndex = computed(() => {
+  if (!showLyricsMainView.value || player.isFullscreenPlayer) return -1
+  return computeActiveLyricIndex(player.lyrics, player.positionSecs, player.durationSecs)
+})
 
 const lyricLineEls = new Map<number, HTMLElement>()
 function setLyricLineRef(el: unknown, idx: number) {
@@ -459,9 +460,16 @@ function handleFullscreenSeekCommit(event: Event) {
   player.seekTo(parseFloat(target.value))
 }
 
+let fullscreenVolumeDebounceTimer: ReturnType<typeof setTimeout> | null = null
 function handleFullscreenVolume(event: Event) {
   const target = event.target as HTMLInputElement
-  player.setVolume(parseFloat(target.value))
+  const val = parseFloat(target.value)
+  player.volume = val
+  if (fullscreenVolumeDebounceTimer) clearTimeout(fullscreenVolumeDebounceTimer)
+  fullscreenVolumeDebounceTimer = setTimeout(() => {
+    fullscreenVolumeDebounceTimer = null
+    player.setVolume(val)
+  }, 40)
 }
 
 onMounted(() => {
@@ -469,6 +477,10 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  if (fullscreenVolumeDebounceTimer) {
+    clearTimeout(fullscreenVolumeDebounceTimer)
+    fullscreenVolumeDebounceTimer = null
+  }
   player.cleanupStore()
 })
 </script>
@@ -514,6 +526,8 @@ onUnmounted(() => {
                       v-if="player.currentThumbnailUrl && !player.lowRamNoImages"
                       :src="player.currentThumbnailUrl"
                       :alt="player.currentTrackTitle"
+                      loading="lazy"
+                      decoding="async"
                       class="w-full h-full object-cover"
                     />
                   </div>
@@ -704,6 +718,8 @@ onUnmounted(() => {
                         v-if="topSearchResult.thumbnail_url && !player.lowRamNoImages"
                         :src="topSearchResult.thumbnail_url"
                         :alt="topSearchResult.title"
+                        loading="lazy"
+                        decoding="async"
                         class="w-full h-full object-cover"
                       />
                     </div>
@@ -1503,6 +1519,8 @@ onUnmounted(() => {
               v-if="player.currentThumbnailUrl && !player.lowRamNoImages"
               :src="player.currentThumbnailUrl"
               :alt="player.currentTrackTitle"
+              loading="lazy"
+              decoding="async"
               class="w-full h-full object-cover"
             />
           </div>

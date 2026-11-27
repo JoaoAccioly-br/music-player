@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { Heart, Loader2, MoreHorizontal, Pause, Play } from 'lucide-vue-next'
 import { getPastelGradient, usePlayerStore, type TrackItem } from '../stores/player'
 
@@ -22,6 +22,13 @@ const emit = defineEmits<{
 
 const player = usePlayerStore()
 const imageFailed = ref(false)
+
+watch(
+  () => props.track.thumbnail_url,
+  () => {
+    imageFailed.value = false
+  }
+)
 
 const isCurrentTrack = computed(() => player.videoId === props.track.video_id)
 const isLiked = computed(() => player.isTrackLiked(props.track.video_id))

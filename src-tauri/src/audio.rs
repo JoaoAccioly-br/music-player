@@ -1,6 +1,8 @@
 use crate::auth::{generate_sapisidhash, AuthSession, FIREFOX_LINUX_UA, YTM_ORIGIN};
 use rodio::{Decoder, OutputStream, Sink, Source};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -12,6 +14,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::sync::Notify;
 
 pub const YT_DLP_LINUX_URL: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux";
@@ -21,6 +24,13 @@ pub const YT_DLP_WINDOWS_URL: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
 pub const YT_DLP_MACOS_URL: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos";
+pub const YT_DLP_SHA256SUMS_URL: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS";
+
+const MAX_YT_DLP_BINARY_BYTES: usize = 100 * 1024 * 1024;
+const MAX_SHA256SUMS_BYTES: usize = 256 * 1024;
+const MAX_YT_DLP_STDERR_BYTES: u64 = 8_192;
+const CANCELLED_ERR_MSG: &str = "Download cancelado (nova música selecionada)";
 
 /// Sentinel returned by `ProgressiveReader::seek(SeekFrom::End(0))` when a progressive stream
 /// is still in flight and does not have an upfront total byte length (e.g. non-DASH container).
@@ -93,18 +103,24 @@ static YT_DLP_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 /// exact duration in seconds before the rest of the stream has finished downloading.
 pub fn parse_mp4_sidx_metadata(data: &[u8]) -> Option<(u64, f64)> {
     let mut pos: usize = 0;
-    while pos + 8 <= data.len() {
+    while pos
+        .checked_add(8)
+        .is_some_and(|hdr_end| hdr_end <= data.len())
+    {
         let size =
             u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         let box_type = &data[pos + 4..pos + 8];
         if size < 8 {
             break;
         }
+        let Some(box_end) = pos.checked_add(size) else {
+            break;
+        };
         if box_type == b"sidx" {
-            if pos + size > data.len() || size < 32 {
+            if box_end > data.len() || size < 32 {
                 return None;
             }
-            let sidx_end = (pos + size) as u64;
+            let sidx_end = box_end as u64;
             let version = data[pos + 8];
             let timescale = u32::from_be_bytes([
                 data[pos + 16],
@@ -119,9 +135,10 @@ pub fn parse_mp4_sidx_metadata(data: &[u8]) -> Option<(u64, f64)> {
                     data[pos + 26],
                     data[pos + 27],
                 ]) as u64;
-                (fo, pos + 28)
+                (fo, pos.checked_add(28)?)
             } else {
-                if pos + 40 > data.len() {
+                let v1_min_end = pos.checked_add(40)?;
+                if v1_min_end > data.len() {
                     return None;
                 }
                 let fo = u64::from_be_bytes([
@@ -134,15 +151,18 @@ pub fn parse_mp4_sidx_metadata(data: &[u8]) -> Option<(u64, f64)> {
                     data[pos + 34],
                     data[pos + 35],
                 ]);
-                (fo, pos + 36)
+                (fo, pos.checked_add(36)?)
             };
 
-            if ref_pos + 4 > pos + size {
+            let ref_hdr_end = ref_pos.checked_add(4)?;
+            if ref_hdr_end > box_end {
                 return None;
             }
             let ref_count = u16::from_be_bytes([data[ref_pos + 2], data[ref_pos + 3]]) as usize;
-            let mut cur = ref_pos + 4;
-            if cur + ref_count * 12 > pos + size {
+            let mut cur = ref_hdr_end;
+            let entries_bytes = ref_count.checked_mul(12)?;
+            let entries_end = cur.checked_add(entries_bytes)?;
+            if entries_end > box_end {
                 return None;
             }
 
@@ -157,12 +177,14 @@ pub fn parse_mp4_sidx_metadata(data: &[u8]) -> Option<(u64, f64)> {
                     data[cur + 6],
                     data[cur + 7],
                 ]);
-                total_ref_size += (raw_size & 0x7FFF_FFFF) as u64;
-                total_dur_ticks += sub_dur as u64;
-                cur += 12;
+                total_ref_size = total_ref_size.saturating_add((raw_size & 0x7FFF_FFFF) as u64);
+                total_dur_ticks = total_dur_ticks.saturating_add(sub_dur as u64);
+                cur = cur.checked_add(12)?;
             }
 
-            let exact_total_bytes = sidx_end + first_offset + total_ref_size;
+            let exact_total_bytes = sidx_end
+                .saturating_add(first_offset)
+                .saturating_add(total_ref_size);
             let duration_secs = if timescale > 0 {
                 (total_dur_ticks as f64) / (timescale as f64)
             } else {
@@ -171,10 +193,10 @@ pub fn parse_mp4_sidx_metadata(data: &[u8]) -> Option<(u64, f64)> {
             return Some((exact_total_bytes, duration_secs));
         }
 
-        if pos + size > data.len() {
+        if box_end > data.len() {
             break;
         }
-        pos += size;
+        pos = box_end;
     }
     None
 }
@@ -293,10 +315,11 @@ impl ProgressiveAudioBuffer {
         parse_mp4_sidx_metadata(&guard.data)
     }
 
-    /// Marks the progressive stream as completely downloaded and wakes all readers.
+    /// Marks the progressive stream as completely downloaded, shrinks excess `Vec` capacity, and wakes all readers.
     pub fn mark_finished(&self) {
         if let Ok(mut guard) = self.shared.state.lock() {
             guard.finished = true;
+            guard.data.shrink_to_fit();
             let final_len = guard.data.len() as u64;
             guard.total_expected = Some(final_len);
             self.shared.cvar.notify_all();
@@ -462,12 +485,18 @@ impl Seek for ProgressiveReader {
             ));
         }
 
-        let target_u64 = target as u64;
+        let target_u64 = u64::try_from(target).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Deslocamento de seek fora dos limites válidos",
+            )
+        })?;
+        let target_usize = usize::try_from(target_u64).unwrap_or(usize::MAX);
 
         // If a decoder/demuxer attempts to seek to a specific byte offset beyond the currently
         // downloaded data, wait on the Condvar until `data.len() >= target` or the stream finishes.
         if !matches!(style, SeekFrom::End(_)) {
-            while (target_u64 as usize) > state.data.len() && !state.finished {
+            while target_usize > state.data.len() && !state.finished {
                 let (new_state, timeout_res) = self
                     .buffer
                     .shared
@@ -475,10 +504,7 @@ impl Seek for ProgressiveReader {
                     .wait_timeout(state, Duration::from_secs(20))
                     .map_err(|_| io::Error::new(io::ErrorKind::Other, "Condvar wait poisoned"))?;
                 state = new_state;
-                if timeout_res.timed_out()
-                    && (target_u64 as usize) > state.data.len()
-                    && !state.finished
-                {
+                if timeout_res.timed_out() && target_usize > state.data.len() && !state.finished {
                     break;
                 }
             }
@@ -528,6 +554,7 @@ pub enum AudioCommand {
     LoadAndPlay {
         data: ProgressiveAudioBuffer,
         volume: f32,
+        start_paused: bool,
     },
     SetPlaying(bool),
     SetVolume(f32),
@@ -564,184 +591,248 @@ impl AudioEngine {
                 let mut seek_offset_secs: f64 = 0.0;
 
                 loop {
-                    match rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(cmd) => {
-                            if stream_opt.is_none() {
-                                stream_opt = OutputStream::try_default().ok();
-                            }
+                    // When idle or paused, block on `rx.recv()` for 0 CPU wakeups/sec.
+                    // Only poll at 100ms intervals while actively playing to update position telemetry.
+                    let recv_res = if sink_opt.is_none() || is_paused {
+                        rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+                    } else {
+                        rx.recv_timeout(Duration::from_millis(100))
+                    };
 
-                            match cmd {
-                                AudioCommand::LoadAndPlay { data, volume } => {
-                                    current_volume = volume.clamp(0.0, 1.0);
-                                    is_paused = false;
-                                    seek_offset_secs = 0.0;
+                    match recv_res {
+                        Ok(cmd) => match cmd {
+                            AudioCommand::LoadAndPlay {
+                                data,
+                                volume,
+                                start_paused,
+                            } => {
+                                current_volume = volume.clamp(0.0, 1.0);
+                                is_paused = start_paused;
+                                seek_offset_secs = 0.0;
 
-                                    if let Some(old_sink) = sink_opt.take() {
-                                        old_sink.stop();
-                                    }
+                                if let Some(old_sink) = sink_opt.take() {
+                                    old_sink.stop();
+                                }
 
-                                    current_buffer = Some(data.clone());
-                                    thread_telemetry.position_ms.store(0, Ordering::Relaxed);
-                                    thread_telemetry
-                                        .is_sink_empty
-                                        .store(false, Ordering::Relaxed);
-                                    thread_telemetry
-                                        .has_active_track
-                                        .store(false, Ordering::Relaxed);
-                                    if let Ok(mut err_guard) = thread_telemetry.last_error.lock() {
-                                        *err_guard = None;
-                                    }
+                                current_buffer = Some(data.clone());
+                                thread_telemetry.position_ms.store(0, Ordering::Relaxed);
+                                thread_telemetry
+                                    .is_sink_empty
+                                    .store(false, Ordering::Relaxed);
+                                thread_telemetry
+                                    .has_active_track
+                                    .store(false, Ordering::Relaxed);
+                                if let Ok(mut err_guard) = thread_telemetry.last_error.lock() {
+                                    *err_guard = None;
+                                }
 
-                                    let mut init_error: Option<String> = None;
-
-                                    if stream_opt.is_none() {
-                                        if let Err(e) = OutputStream::try_default() {
+                                let mut init_error: Option<String> = None;
+                                if stream_opt.is_none() {
+                                    match OutputStream::try_default() {
+                                        Ok(stream) => stream_opt = Some(stream),
+                                        Err(e) => {
                                             init_error = Some(format!(
                                                 "Nenhum dispositivo de saída de áudio disponível no sistema ({e})."
                                             ));
                                         }
                                     }
+                                }
 
-                                    // Try creating a Sink on the active OutputStream; if the OS audio
-                                    // endpoint changed or disconnected (common on Windows WASAPI when
-                                    // switching headphones/Bluetooth/HDMI), re-initialize OutputStream once!
-                                    let new_sink_res = if let Some((_, ref stream_handle)) = stream_opt {
-                                        match Sink::try_new(stream_handle) {
-                                            Ok(sink) => Ok(sink),
-                                            Err(_) => {
-                                                stream_opt = OutputStream::try_default().ok();
-                                                if let Some((_, ref fresh_handle)) = stream_opt {
-                                                    Sink::try_new(fresh_handle).map_err(|e| {
-                                                        format!("Falha ao abrir canal de saída de áudio: {e}")
-                                                    })
+                                // Try creating a Sink on the active OutputStream; if the OS audio
+                                // endpoint changed or disconnected (common on Windows WASAPI when
+                                // switching headphones/Bluetooth/HDMI), re-initialize OutputStream once!
+                                let new_sink_res = if let Some((_, ref stream_handle)) = stream_opt
+                                {
+                                    match Sink::try_new(stream_handle) {
+                                        Ok(sink) => Ok(sink),
+                                        Err(_) => {
+                                            stream_opt = OutputStream::try_default().ok();
+                                            if let Some((_, ref fresh_handle)) = stream_opt {
+                                                Sink::try_new(fresh_handle).map_err(|e| {
+                                                    format!(
+                                                        "Falha ao abrir canal de saída de áudio: {e}"
+                                                    )
+                                                })
+                                            } else {
+                                                Err(
+                                                    "Dispositivo de saída de áudio desconectado ou indisponível."
+                                                        .to_string(),
+                                                )
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    Err(init_error.take().unwrap_or_else(|| {
+                                        "Nenhum dispositivo de saída de áudio disponível no sistema."
+                                            .to_string()
+                                    }))
+                                };
+
+                                match new_sink_res {
+                                    Ok(new_sink) => {
+                                        new_sink.set_volume(current_volume);
+                                        match Decoder::new(data.reader()) {
+                                            Ok(decoder) => {
+                                                new_sink.append(decoder);
+                                                if start_paused {
+                                                    new_sink.pause();
                                                 } else {
-                                                    Err("Dispositivo de saída de áudio desconectado ou indisponível.".to_string())
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        Err(init_error.take().unwrap_or_else(|| {
-                                            "Nenhum dispositivo de saída de áudio disponível no sistema."
-                                                .to_string()
-                                        }))
-                                    };
-
-                                    match new_sink_res {
-                                        Ok(new_sink) => {
-                                            new_sink.set_volume(current_volume);
-                                            match Decoder::new(data.reader()) {
-                                                Ok(decoder) => {
-                                                    new_sink.append(decoder);
                                                     new_sink.play();
-                                                    sink_opt = Some(new_sink);
-                                                    thread_telemetry
-                                                        .has_active_track
-                                                        .store(true, Ordering::Relaxed);
                                                 }
-                                                Err(e) => {
-                                                    init_error = Some(format!(
-                                                        "Falha ao decodificar fluxo de áudio: {e}"
-                                                    ));
-                                                }
+                                                sink_opt = Some(new_sink);
+                                                thread_telemetry
+                                                    .has_active_track
+                                                    .store(true, Ordering::Relaxed);
+                                            }
+                                            Err(e) => {
+                                                init_error = Some(format!(
+                                                    "Falha ao decodificar fluxo de áudio: {e}"
+                                                ));
                                             }
                                         }
-                                        Err(err_msg) => {
-                                            init_error = Some(err_msg);
-                                        }
                                     }
-
-                                    if let Some(err_msg) = init_error {
-                                        thread_telemetry
-                                            .is_sink_empty
-                                            .store(true, Ordering::Relaxed);
-                                        if let Ok(mut err_guard) = thread_telemetry.last_error.lock() {
-                                            *err_guard = Some(err_msg);
-                                        }
+                                    Err(err_msg) => {
+                                        init_error = Some(err_msg);
                                     }
                                 }
-                                AudioCommand::SetPlaying(should_play) => {
-                                    is_paused = !should_play;
-                                    if let Some(ref sink) = sink_opt {
-                                        if should_play {
-                                            sink.play();
-                                        } else {
-                                            sink.pause();
-                                        }
-                                    }
-                                }
-                                AudioCommand::SetVolume(vol) => {
-                                    current_volume = vol.clamp(0.0, 1.0);
-                                    if let Some(ref sink) = sink_opt {
-                                        sink.set_volume(current_volume);
-                                    }
-                                }
-                                AudioCommand::Seek(position_secs) => {
-                                    let clamped_secs = position_secs.max(0.0);
-                                    let target = Duration::from_secs_f64(clamped_secs);
-                                    let mut seek_succeeded = false;
 
-                                    if let Some(ref sink) = sink_opt {
-                                        if !sink.empty() && sink.try_seek(target).is_ok() {
-                                            seek_succeeded = true;
-                                            seek_offset_secs = 0.0;
-                                        }
-                                    }
-
-                                    if !seek_succeeded {
-                                        if let (Some((_, ref stream_handle)), Some(ref buffer)) =
-                                            (&stream_opt, &current_buffer)
-                                        {
-                                            if let Some(old_sink) = sink_opt.take() {
-                                                old_sink.stop();
-                                            }
-                                            if let Ok(new_sink) = Sink::try_new(stream_handle) {
-                                                new_sink.set_volume(current_volume);
-                                                if let Ok(mut decoder) =
-                                                    Decoder::new(buffer.reader())
-                                                {
-                                                    if decoder.try_seek(target).is_ok() {
-                                                        seek_offset_secs = clamped_secs;
-                                                        new_sink.append(decoder);
-                                                    } else if let Ok(dec_skip) =
-                                                        Decoder::new(buffer.reader())
-                                                    {
-                                                        seek_offset_secs = clamped_secs;
-                                                        new_sink
-                                                            .append(dec_skip.skip_duration(target));
-                                                    }
-                                                    if is_paused {
-                                                        new_sink.pause();
-                                                    } else {
-                                                        new_sink.play();
-                                                    }
-                                                    sink_opt = Some(new_sink);
-                                                }
-                                            }
-                                        } else {
-                                            seek_offset_secs = clamped_secs;
-                                        }
-                                    }
-
-                                    thread_telemetry
-                                        .position_ms
-                                        .store((clamped_secs * 1000.0) as u64, Ordering::Relaxed);
-                                }
-                                AudioCommand::Stop => {
-                                    if let Some(old_sink) = sink_opt.take() {
-                                        old_sink.stop();
-                                    }
-                                    current_buffer = None;
-                                    seek_offset_secs = 0.0;
-                                    thread_telemetry.position_ms.store(0, Ordering::Relaxed);
+                                if let Some(err_msg) = init_error {
                                     thread_telemetry
                                         .is_sink_empty
                                         .store(true, Ordering::Relaxed);
-                                    thread_telemetry
-                                        .has_active_track
-                                        .store(false, Ordering::Relaxed);
+                                    if let Ok(mut err_guard) = thread_telemetry.last_error.lock() {
+                                        *err_guard = Some(err_msg);
+                                    }
                                 }
                             }
-                        }
+                            AudioCommand::SetPlaying(should_play) => {
+                                is_paused = !should_play;
+                                if let Some(ref sink) = sink_opt {
+                                    if should_play {
+                                        sink.play();
+                                    } else {
+                                        sink.pause();
+                                    }
+                                }
+                            }
+                            AudioCommand::SetVolume(vol) => {
+                                current_volume = vol.clamp(0.0, 1.0);
+                                if let Some(ref sink) = sink_opt {
+                                    sink.set_volume(current_volume);
+                                }
+                            }
+                            AudioCommand::Seek(position_secs) => {
+                                let clamped_secs = position_secs.max(0.0);
+                                let target = Duration::from_secs_f64(clamped_secs);
+                                let mut seek_succeeded = false;
+
+                                if let Some(ref sink) = sink_opt {
+                                    if !sink.empty() && sink.try_seek(target).is_ok() {
+                                        seek_succeeded = true;
+                                        seek_offset_secs = 0.0;
+                                    }
+                                }
+
+                                if !seek_succeeded {
+                                    if stream_opt.is_none() {
+                                        stream_opt = OutputStream::try_default().ok();
+                                    }
+                                    if let (Some((_, ref stream_handle)), Some(ref buffer)) =
+                                        (&stream_opt, &current_buffer)
+                                    {
+                                        if let Some(old_sink) = sink_opt.take() {
+                                            old_sink.stop();
+                                        }
+                                        let mut seek_err: Option<String> = None;
+                                        match Sink::try_new(stream_handle) {
+                                            Ok(new_sink) => {
+                                                new_sink.set_volume(current_volume);
+                                                match Decoder::new(buffer.reader()) {
+                                                    Ok(mut decoder) => {
+                                                        if decoder.try_seek(target).is_ok() {
+                                                            seek_offset_secs = clamped_secs;
+                                                            new_sink.append(decoder);
+                                                            if is_paused {
+                                                                new_sink.pause();
+                                                            } else {
+                                                                new_sink.play();
+                                                            }
+                                                            sink_opt = Some(new_sink);
+                                                        } else {
+                                                            match Decoder::new(buffer.reader()) {
+                                                                Ok(dec_skip) => {
+                                                                    seek_offset_secs = clamped_secs;
+                                                                    new_sink.append(
+                                                                        dec_skip
+                                                                            .skip_duration(target),
+                                                                    );
+                                                                    if is_paused {
+                                                                        new_sink.pause();
+                                                                    } else {
+                                                                        new_sink.play();
+                                                                    }
+                                                                    sink_opt = Some(new_sink);
+                                                                }
+                                                                Err(e) => {
+                                                                    seek_err = Some(format!(
+                                                                        "Falha ao reposicionar decodificador de áudio: {e}"
+                                                                    ));
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        seek_err = Some(format!(
+                                                            "Falha ao reabrir decodificador de áudio durante seek: {e}"
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                seek_err = Some(format!(
+                                                    "Falha ao recriar canal de saída de áudio durante seek: {e}"
+                                                ));
+                                            }
+                                        }
+
+                                        if let Some(err_msg) = seek_err {
+                                            thread_telemetry
+                                                .has_active_track
+                                                .store(false, Ordering::Relaxed);
+                                            thread_telemetry
+                                                .is_sink_empty
+                                                .store(true, Ordering::Relaxed);
+                                            if let Ok(mut err_guard) =
+                                                thread_telemetry.last_error.lock()
+                                            {
+                                                *err_guard = Some(err_msg);
+                                            }
+                                        }
+                                    } else {
+                                        seek_offset_secs = clamped_secs;
+                                    }
+                                }
+
+                                thread_telemetry
+                                    .position_ms
+                                    .store((clamped_secs * 1000.0) as u64, Ordering::Relaxed);
+                            }
+                            AudioCommand::Stop => {
+                                if let Some(old_sink) = sink_opt.take() {
+                                    old_sink.stop();
+                                }
+                                current_buffer = None;
+                                is_paused = false;
+                                seek_offset_secs = 0.0;
+                                thread_telemetry.position_ms.store(0, Ordering::Relaxed);
+                                thread_telemetry
+                                    .is_sink_empty
+                                    .store(true, Ordering::Relaxed);
+                                thread_telemetry
+                                    .has_active_track
+                                    .store(false, Ordering::Relaxed);
+                            }
+                        },
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
@@ -825,6 +916,7 @@ pub struct ExtractedAudio {
     pub quality_label: String,
     pub title: Option<String>,
     pub author: Option<String>,
+    pub cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 /// Resolves `<app_data_dir>/bin/yt-dlp` (or `yt-dlp.exe` on Windows).
@@ -852,10 +944,75 @@ pub fn clean_temp_cookie_files() {
     }
 }
 
-/// Ensures the standalone `yt-dlp` binary exists at `~/.local/share/com.ytmusic.rust/bin/yt-dlp`.
-/// If not present on disk, automatically downloads `yt-dlp_linux` from the official GitHub release
-/// and sets executable permissions (`0755`). Protected by an async mutex so concurrent calls
-/// never race on `yt-dlp.part`.
+fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn parse_sha256sums_for_asset(sums_text: &str, asset_name: &str) -> Option<String> {
+    for line in sums_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let (Some(hash), Some(raw_name)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let clean_name = raw_name.trim_start_matches('*').trim_start_matches("./");
+        if clean_name == asset_name
+            && hash.len() == 64
+            && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+async fn read_response_bytes_bounded(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    if let Some(content_len) = resp.content_length() {
+        if content_len > max_bytes as u64 {
+            return Err(format!(
+                "{label} excedeu o limite seguro de {max_bytes} bytes ({content_len} bytes)"
+            ));
+        }
+    }
+
+    let initial_cap = resp
+        .content_length()
+        .map(|n| (n as usize).min(max_bytes))
+        .unwrap_or(64 * 1024);
+    let mut out = Vec::with_capacity(initial_cap);
+
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("Erro ao ler bytes de {label}: {e}"))?
+    {
+        if out.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!(
+                "{label} excedeu o limite seguro de {max_bytes} bytes"
+            ));
+        }
+        out.extend_from_slice(&chunk);
+    }
+
+    Ok(out)
+}
+
+/// Ensures the standalone `yt-dlp` binary exists at `<app_data_dir>/bin/yt-dlp` (`yt-dlp.exe` on Windows).
+/// If not present on disk, downloads the official GitHub release binary + `SHA2-256SUMS`,
+/// verifies the SHA-256 digest before persisting, and sets executable permissions (`0755` on Unix).
+/// Protected by an async mutex so concurrent calls never race.
 pub async fn ensure_yt_dlp_binary() -> Result<PathBuf, String> {
     let init_mutex = YT_DLP_INIT_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
     let _guard = init_mutex.lock().await;
@@ -867,6 +1024,9 @@ pub async fn ensure_yt_dlp_binary() -> Result<PathBuf, String> {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
+                    if let Some(parent) = bin_path.parent() {
+                        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+                    }
                     let _ = fs::set_permissions(&bin_path, fs::Permissions::from_mode(0o755));
                 }
                 return Ok(bin_path);
@@ -877,6 +1037,28 @@ pub async fn ensure_yt_dlp_binary() -> Result<PathBuf, String> {
     if let Some(parent) = bin_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("Falha ao criar diretório para yt-dlp: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    let download_url = get_yt_dlp_download_url();
+    let asset_name = download_url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "URL de download do yt-dlp inválida".to_string())?;
+
+    let parsed_sums_url = reqwest::Url::parse(YT_DLP_SHA256SUMS_URL)
+        .map_err(|e| format!("URL de SHA2-256SUMS inválida: {e}"))?;
+    let parsed_bin_url = reqwest::Url::parse(download_url)
+        .map_err(|e| format!("URL do binário yt-dlp inválida: {e}"))?;
+    if !is_trusted_yt_dlp_download_url(&parsed_sums_url)
+        || !is_trusted_yt_dlp_download_url(&parsed_bin_url)
+    {
+        return Err("URL de download do yt-dlp não confiável".to_string());
     }
 
     let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
@@ -896,8 +1078,32 @@ pub async fn ensure_yt_dlp_binary() -> Result<PathBuf, String> {
         .build()
         .map_err(|e| format!("Falha ao inicializar cliente HTTP para yt-dlp: {e}"))?;
 
+    // 1. Fetch official SHA2-256SUMS from the same GitHub release (bounded to 256 KB)
+    let sums_resp = client
+        .get(YT_DLP_SHA256SUMS_URL)
+        .header("User-Agent", FIREFOX_LINUX_UA)
+        .send()
+        .await
+        .map_err(|e| format!("Falha ao baixar SHA2-256SUMS oficial do yt-dlp: {e}"))?;
+
+    if !sums_resp.status().is_success() {
+        return Err(format!(
+            "Download de SHA2-256SUMS do yt-dlp retornou HTTP {} (verificação obrigatória)",
+            sums_resp.status()
+        ));
+    }
+
+    let sums_bytes =
+        read_response_bytes_bounded(sums_resp, MAX_SHA256SUMS_BYTES, "SHA2-256SUMS").await?;
+    let sums_text = String::from_utf8(sums_bytes)
+        .map_err(|e| format!("SHA2-256SUMS do yt-dlp não é UTF-8 válido: {e}"))?;
+    let expected_sha256 = parse_sha256sums_for_asset(&sums_text, asset_name).ok_or_else(|| {
+        format!("Checksum SHA-256 para '{asset_name}' não encontrado em SHA2-256SUMS")
+    })?;
+
+    // 2. Download the standalone yt-dlp binary bounded to 100 MB
     let resp = client
-        .get(get_yt_dlp_download_url())
+        .get(download_url)
         .header("User-Agent", FIREFOX_LINUX_UA)
         .send()
         .await
@@ -910,40 +1116,70 @@ pub async fn ensure_yt_dlp_binary() -> Result<PathBuf, String> {
         ));
     }
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("Erro ao ler bytes do binário yt-dlp: {e}"))?;
+    let bytes =
+        read_response_bytes_bounded(resp, MAX_YT_DLP_BINARY_BYTES, "binário yt-dlp").await?;
 
     if bytes.len() < 1_000_000 {
         return Err("Binário yt-dlp corrompido ou incompleto baixado do GitHub".to_string());
     }
 
-    let tmp_path = PathBuf::from(format!("{}.part", bin_path.display()));
-
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o755)
-            .open(&tmp_path)
-            .map_err(|e| format!("Falha ao criar arquivo temporário do yt-dlp: {e}"))?;
-        file.write_all(&bytes)
-            .map_err(|e| format!("Falha ao gravar bytes do yt-dlp: {e}"))?;
+    // 3. Verify SHA-256 integrity before writing to disk
+    let actual_sha256 = sha256_hex(&bytes);
+    if actual_sha256 != expected_sha256 {
+        return Err(format!(
+            "Falha na verificação SHA-256 do binário yt-dlp ({asset_name}): esperado {expected_sha256}, obtido {actual_sha256}"
+        ));
     }
 
-    #[cfg(not(unix))]
-    {
-        fs::write(&tmp_path, &bytes)
-            .map_err(|e| format!("Falha ao salvar yt-dlp temporário: {e}"))?;
-    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = PathBuf::from(format!(
+        "{}.{}.{}.part",
+        bin_path.display(),
+        std::process::id(),
+        nanos
+    ));
 
-    fs::rename(&tmp_path, &bin_path).map_err(|e| format!("Falha ao mover yt-dlp: {e}"))?;
+    let write_res: Result<(), String> = (|| {
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o755)
+                .open(&tmp_path)
+                .map_err(|e| format!("Falha ao criar arquivo temporário do yt-dlp: {e}"))?;
+            file.write_all(&bytes)
+                .map_err(|e| format!("Falha ao gravar bytes do yt-dlp: {e}"))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            fs::write(&tmp_path, &bytes)
+                .map_err(|e| format!("Falha ao salvar yt-dlp temporário: {e}"))?;
+        }
+
+        #[cfg(windows)]
+        {
+            if bin_path.exists() {
+                let _ = fs::remove_file(&bin_path);
+            }
+        }
+
+        fs::rename(&tmp_path, &bin_path).map_err(|e| format!("Falha ao mover yt-dlp: {e}"))?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
 
     Ok(bin_path)
 }
@@ -1068,21 +1304,82 @@ pub fn write_temp_netscape_cookies(session: &AuthSession) -> Option<PathBuf> {
     }
 }
 
+/// RAII guard ensuring temporary Netscape cookie files are always removed once no longer needed
+/// by the `yt-dlp` subprocess (with sole ownership transferred to the background pump task when active).
+struct CookieFileGuard(Option<PathBuf>);
+
+impl CookieFileGuard {
+    fn as_ref(&self) -> Option<&PathBuf> {
+        self.0.as_ref()
+    }
+
+    fn take(&mut self) -> Option<PathBuf> {
+        self.0.take()
+    }
+}
+
+impl Drop for CookieFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn is_stream_cancelled(
+    generation_pair: &Option<(u64, Arc<AtomicU64>)>,
+    cancel_flag: &Option<Arc<AtomicBool>>,
+    probe_abort: Option<&Arc<AtomicBool>>,
+) -> bool {
+    if let Some((expected_gen, counter)) = generation_pair {
+        if counter.load(Ordering::SeqCst) != *expected_gen {
+            return true;
+        }
+    }
+    if let Some(flag) = cancel_flag {
+        if flag.load(Ordering::SeqCst) {
+            return true;
+        }
+    }
+    if let Some(abort) = probe_abort {
+        if abort.load(Ordering::SeqCst) {
+            return true;
+        }
+    }
+    false
+}
+
+fn sanitize_yt_dlp_stderr(raw: &str, cookie_path: Option<&PathBuf>) -> String {
+    let mut sanitized = raw.to_string();
+    if let Some(cp) = cookie_path {
+        let cp_str = cp.to_string_lossy();
+        if !cp_str.is_empty() {
+            sanitized = sanitized.replace(cp_str.as_ref(), "[cookies]");
+        }
+    }
+    let cookie_dir = get_temp_cookie_dir();
+    let dir_str = cookie_dir.to_string_lossy();
+    if !dir_str.is_empty() {
+        sanitized = sanitized.replace(dir_str.as_ref(), "[app-data]");
+    }
+    let collapsed = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(300).collect()
+}
+
 /// Primary extraction engine:
-/// 1. Uses the isolated `~/.local/share/com.ytmusic.rust/bin/yt-dlp` binary to stream real YouTube
+/// 1. Uses the isolated `<app_data_dir>/bin/yt-dlp` binary to stream real YouTube
 ///    `m4a` (`itag 140` / `bestaudio[ext=m4a]`) bytes directly to `stdout` into a progressive RAM
 ///    `ProgressiveAudioBuffer`. As soon as the initial 256 KB header (`ftyp` + `moov` + `sidx` + first
 ///    `moof`/`mdat` audio frames) is buffered and verified by `rodio::Decoder`, returns immediately
 ///    while a background task continues feeding the remaining chunks!
-///    Supports immediate cancellation via `generation_pair` (`kill_on_drop(true)`) so switching
-///    songs quickly kills the old `yt-dlp` process right away.
+///    Supports immediate cancellation via `generation_pair` and/or per-stream `cancel_flag` (`kill_on_drop(true)`).
 /// 2. Falls back to direct Innertube `/youtubei/v1/player` extraction if `yt-dlp` is unavailable.
 /// 3. Never plays fake synthesized audio — returns `Err(String)` if real extraction fails.
 pub async fn extract_youtube_audio_stream(
     video_id: &str,
     auth: Option<&AuthSession>,
 ) -> Result<ExtractedAudio, String> {
-    extract_youtube_audio_stream_cancellable(video_id, auth, None).await
+    extract_youtube_audio_stream_internal(video_id, auth, None, None).await
 }
 
 pub async fn extract_youtube_audio_stream_cancellable(
@@ -1090,18 +1387,50 @@ pub async fn extract_youtube_audio_stream_cancellable(
     auth: Option<&AuthSession>,
     generation_pair: Option<(u64, Arc<AtomicU64>)>,
 ) -> Result<ExtractedAudio, String> {
+    extract_youtube_audio_stream_internal(video_id, auth, generation_pair, None).await
+}
+
+pub async fn extract_youtube_audio_stream_with_cancel(
+    video_id: &str,
+    auth: Option<&AuthSession>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<ExtractedAudio, String> {
+    extract_youtube_audio_stream_internal(video_id, auth, None, cancel_flag).await
+}
+
+async fn extract_youtube_audio_stream_internal(
+    video_id: &str,
+    auth: Option<&AuthSession>,
+    generation_pair: Option<(u64, Arc<AtomicU64>)>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<ExtractedAudio, String> {
+    if is_stream_cancelled(&generation_pair, &cancel_flag, None) {
+        return Err(CANCELLED_ERR_MSG.to_string());
+    }
+
     let clean_id = parse_youtube_video_id(video_id);
 
     // Step A: Primary extraction via isolated yt-dlp binary streaming progressively to RAM
-    match try_fetch_yt_dlp_audio(&clean_id, auth, generation_pair.clone()).await {
-        Ok(audio) => return Ok(audio),
-        Err(e) if e == "Download cancelado (nova música selecionada)" => return Err(e),
+    match try_fetch_yt_dlp_audio(
+        &clean_id,
+        auth,
+        generation_pair.clone(),
+        cancel_flag.clone(),
+    )
+    .await
+    {
+        Ok(audio) => Ok(audio),
+        Err(e) if e == CANCELLED_ERR_MSG => Err(e),
         Err(yt_dlp_err) => {
-            // Step B: Secondary attempt via direct Innertube HTTP client
-            if let Ok(innertube_audio) = try_fetch_innertube_audio(&clean_id, auth).await {
-                return Ok(innertube_audio);
+            if is_stream_cancelled(&generation_pair, &cancel_flag, None) {
+                return Err(CANCELLED_ERR_MSG.to_string());
             }
-            return Err(yt_dlp_err);
+            // Step B: Secondary attempt via direct Innertube HTTP client
+            match try_fetch_innertube_audio(&clean_id, auth, generation_pair, cancel_flag).await {
+                Ok(innertube_audio) => Ok(innertube_audio),
+                Err(e) if e == CANCELLED_ERR_MSG => Err(e),
+                Err(_) => Err(yt_dlp_err),
+            }
         }
     }
 }
@@ -1110,44 +1439,61 @@ async fn try_fetch_yt_dlp_audio(
     video_id: &str,
     auth: Option<&AuthSession>,
     generation_pair: Option<(u64, Arc<AtomicU64>)>,
+    cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<ExtractedAudio, String> {
     let bin_path = ensure_yt_dlp_binary().await?;
 
+    if is_stream_cancelled(&generation_pair, &cancel_flag, None) {
+        return Err(CANCELLED_ERR_MSG.to_string());
+    }
+
     let is_auth = auth.is_some_and(|s| s.is_authenticated);
 
-    // If user is authenticated, use cookies directly to prevent 1.5-4s penalty waiting for unauthenticated failure
+    // If user is authenticated, use cookies directly to prevent 1.5-4s penalty waiting for unauthenticated failure.
+    // Ownership of `cookies_file` is transferred into `run_yt_dlp_stdout_stream` so it is only deleted once
+    // `yt-dlp` has finished (never racing with an active background pump task).
     if is_auth {
         if let Some(session) = auth {
             if let Some(cookies_file) = write_temp_netscape_cookies(session) {
                 let res = run_yt_dlp_stdout_stream(
                     &bin_path,
                     video_id,
-                    Some(&cookies_file),
+                    Some(cookies_file),
                     generation_pair.clone(),
+                    cancel_flag.clone(),
                 )
                 .await;
-                let _ = fs::remove_file(&cookies_file);
                 match res {
                     Ok(audio) => return Ok(audio),
-                    Err(e) if e == "Download cancelado (nova música selecionada)" => {
-                        return Err(e)
-                    }
+                    Err(e) if e == CANCELLED_ERR_MSG => return Err(e),
                     Err(_) => {} // Fallback to unauthenticated below if cookies failed
                 }
             }
         }
     }
 
+    if is_stream_cancelled(&generation_pair, &cancel_flag, None) {
+        return Err(CANCELLED_ERR_MSG.to_string());
+    }
+
     // Unauthenticated attempt
-    run_yt_dlp_stdout_stream(&bin_path, video_id, None, generation_pair).await
+    run_yt_dlp_stdout_stream(&bin_path, video_id, None, generation_pair, cancel_flag).await
 }
 
 async fn run_yt_dlp_stdout_stream(
     bin_path: &PathBuf,
     video_id: &str,
-    cookies_file: Option<&PathBuf>,
+    cookies_file: Option<PathBuf>,
     generation_pair: Option<(u64, Arc<AtomicU64>)>,
+    cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<ExtractedAudio, String> {
+    let mut cookie_guard = CookieFileGuard(cookies_file);
+    let has_cookies = cookie_guard.as_ref().is_some();
+    let cookie_path_for_redaction = cookie_guard.as_ref().cloned();
+
+    let effective_cancel = cancel_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let cancel_opt = Some(effective_cancel.clone());
+
     let url = format!("https://www.youtube.com/watch?v={video_id}");
 
     let mut cmd = Command::new(bin_path);
@@ -1165,11 +1511,12 @@ async fn run_yt_dlp_stdout_stream(
         .arg("--no-part")
         .arg("--no-cache-dir");
 
-    if let Some(cookie_path) = cookies_file {
+    if let Some(cookie_path) = cookie_guard.as_ref() {
         cmd.arg("--cookies").arg(cookie_path);
     }
 
-    cmd.arg(&url)
+    cmd.arg("--")
+        .arg(&url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1200,11 +1547,9 @@ async fn run_yt_dlp_stdout_stream(
     let mut eof_reached = false;
 
     while progressive_buffer.len() < initial_threshold {
-        if let Some((expected_gen, ref counter)) = generation_pair {
-            if counter.load(Ordering::SeqCst) != expected_gen {
-                let _ = child.kill().await;
-                return Err("Download cancelado (nova música selecionada)".to_string());
-            }
+        if is_stream_cancelled(&generation_pair, &cancel_opt, None) {
+            let _ = child.kill().await;
+            return Err(CANCELLED_ERR_MSG.to_string());
         }
 
         let read_res = tokio::time::timeout(Duration::from_secs(30), stdout.read(&mut chunk)).await;
@@ -1232,13 +1577,20 @@ async fn run_yt_dlp_stdout_stream(
     }
 
     if progressive_buffer.len() < 16_384 {
-        let status = child.wait().await.ok();
-        let exit_code = status.and_then(|s| s.code());
-        let mut err_msg = String::new();
-        if let Some(ref mut err_pipe) = stderr {
-            let _ = err_pipe.read_to_string(&mut err_msg).await;
-        }
-        let clean_err = err_msg.trim();
+        drop(stdout);
+        let stderr_fut = async {
+            let mut err_bytes = Vec::new();
+            if let Some(err_pipe) = stderr.take() {
+                let _ = err_pipe
+                    .take(MAX_YT_DLP_STDERR_BYTES)
+                    .read_to_end(&mut err_bytes)
+                    .await;
+            }
+            String::from_utf8_lossy(&err_bytes).into_owned()
+        };
+        let (status_res, raw_err_msg) = tokio::join!(child.wait(), stderr_fut);
+        let exit_code = status_res.ok().and_then(|s| s.code());
+        let clean_err = sanitize_yt_dlp_stderr(&raw_err_msg, cookie_path_for_redaction.as_ref());
         if !clean_err.is_empty() {
             return Err(format!("yt-dlp falhou para {video_id}: {clean_err}"));
         }
@@ -1257,26 +1609,39 @@ async fn run_yt_dlp_stdout_stream(
         ));
     }
 
-    let cookies_to_cleanup = cookies_file.cloned();
+    let probe_abort = Arc::new(AtomicBool::new(false));
+    let probe_abort_notify = Arc::new(Notify::new());
 
-    // Spawn the background chunk reader via async runtime without allocating dedicated OS thread stack
+    // Spawn the background chunk reader via async runtime without allocating dedicated OS thread stack.
+    // Transfer sole ownership of `cookie_guard` to the background task when `!eof_reached`.
     if !eof_reached {
+        drop(stderr);
         let bg_buffer = progressive_buffer.clone();
         let bg_gen = generation_pair.clone();
+        let bg_cancel = cancel_opt.clone();
+        let bg_probe_abort = probe_abort.clone();
+        let bg_probe_notify = probe_abort_notify.clone();
+        let bg_cookie_guard = CookieFileGuard(cookie_guard.take());
         tauri::async_runtime::spawn(async move {
+            let _cookie_guard = bg_cookie_guard;
             let mut bg_chunk = [0u8; 32_768];
             loop {
-                if let Some((expected_gen, ref counter)) = bg_gen {
-                    if counter.load(Ordering::SeqCst) != expected_gen {
-                        let _ = child.kill().await;
-                        bg_buffer
-                            .mark_error("Download cancelado (nova música selecionada)".to_string());
-                        break;
-                    }
+                if is_stream_cancelled(&bg_gen, &bg_cancel, Some(&bg_probe_abort)) {
+                    let _ = child.kill().await;
+                    bg_buffer.mark_error(CANCELLED_ERR_MSG.to_string());
+                    break;
                 }
 
-                let read_res =
-                    tokio::time::timeout(Duration::from_secs(30), stdout.read(&mut bg_chunk)).await;
+                let read_res = tokio::select! {
+                    biased;
+                    _ = bg_probe_notify.notified() => {
+                        let _ = child.kill().await;
+                        bg_buffer.mark_error("Probe de decodificação de áudio falhou".to_string());
+                        break;
+                    }
+                    res = tokio::time::timeout(Duration::from_secs(30), stdout.read(&mut bg_chunk)) => res,
+                };
+
                 match read_res {
                     Ok(Ok(0)) => {
                         bg_buffer.mark_finished();
@@ -1309,12 +1674,13 @@ async fn run_yt_dlp_stdout_stream(
                 }
             }
             let _ = child.wait().await;
-            if let Some(cookie_path) = cookies_to_cleanup {
-                let _ = fs::remove_file(cookie_path);
-            }
+            drop(_cookie_guard);
         });
-    } else if let Some(cookie_path) = cookies_to_cleanup {
-        let _ = fs::remove_file(cookie_path);
+    } else {
+        drop(stdout);
+        drop(stderr);
+        let _ = child.wait().await;
+        drop(cookie_guard);
     }
 
     // Always verify that `rodio::Decoder` can actually initialize on the stream before returning
@@ -1326,7 +1692,7 @@ async fn run_yt_dlp_stdout_stream(
 
     let probe_buffer = progressive_buffer.clone();
     let vid_owned = video_id.to_string();
-    let probed_duration = tokio::task::spawn_blocking(move || {
+    let probe_res = tokio::task::spawn_blocking(move || {
         let decoder = Decoder::new(probe_buffer.reader()).map_err(|e| {
             format!("Falha ao decodificar container de áudio para {vid_owned}: {e}")
         })?;
@@ -1337,15 +1703,34 @@ async fn run_yt_dlp_stdout_stream(
             .unwrap_or(0.0);
         Ok::<f64, String>(dur)
     })
-    .await
-    .map_err(|e| format!("Erro na thread de probe de áudio: {e}"))??;
+    .await;
+
+    let probed_duration = match probe_res {
+        Ok(Ok(dur)) => dur,
+        Ok(Err(err_msg)) => {
+            probe_abort.store(true, Ordering::SeqCst);
+            probe_abort_notify.notify_waiters();
+            return Err(err_msg);
+        }
+        Err(join_err) => {
+            probe_abort.store(true, Ordering::SeqCst);
+            probe_abort_notify.notify_waiters();
+            return Err(format!("Erro na thread de probe de áudio: {join_err}"));
+        }
+    };
+
+    if is_stream_cancelled(&generation_pair, &cancel_opt, None) {
+        probe_abort.store(true, Ordering::SeqCst);
+        probe_abort_notify.notify_waiters();
+        return Err(CANCELLED_ERR_MSG.to_string());
+    }
 
     let decoded_duration = sidx_meta
         .map(|(_, sidx_dur)| sidx_dur)
         .filter(|&d| d > 1.0)
         .unwrap_or(probed_duration);
 
-    let quality_label = if cookies_file.is_some() {
+    let quality_label = if has_cookies {
         "128 kbps M4A (yt-dlp • Streaming Progressivo Autenticado)".to_string()
     } else {
         "128 kbps M4A (yt-dlp • Streaming Progressivo em Chunks)".to_string()
@@ -1357,6 +1742,7 @@ async fn run_yt_dlp_stdout_stream(
         quality_label,
         title: None,
         author: None,
+        cancel_flag: Some(effective_cancel),
     })
 }
 
@@ -1385,6 +1771,8 @@ struct ClientProfile {
 async fn try_fetch_innertube_audio(
     video_id: &str,
     auth: Option<&AuthSession>,
+    generation_pair: Option<(u64, Arc<AtomicU64>)>,
+    cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<ExtractedAudio, String> {
     let client = crate::innertube::get_shared_http_client();
 
@@ -1454,6 +1842,10 @@ async fn try_fetch_innertube_audio(
     ];
 
     for profile in profiles {
+        if is_stream_cancelled(&generation_pair, &cancel_flag, None) {
+            return Err(CANCELLED_ERR_MSG.to_string());
+        }
+
         let mut client_obj = json!({
             "clientName": profile.name,
             "clientVersion": profile.version,
@@ -1508,7 +1900,7 @@ async fn try_fetch_innertube_audio(
             continue;
         }
 
-        let Ok(json_data) = resp.json::<Value>().await else {
+        let Ok(json_data) = crate::innertube::read_json_bounded(resp, 5 * 1024 * 1024).await else {
             continue;
         };
 
@@ -1574,6 +1966,10 @@ async fn try_fetch_innertube_audio(
             continue;
         }
 
+        if is_stream_cancelled(&generation_pair, &cancel_flag, None) {
+            return Err(CANCELLED_ERR_MSG.to_string());
+        }
+
         let max_bytes: usize = 25 * 1024 * 1024;
         let get_req = client
             .get(&stream_url)
@@ -1581,7 +1977,7 @@ async fn try_fetch_innertube_audio(
             .header("Origin", profile.origin)
             .header("Range", format!("bytes=0-{}", max_bytes - 1));
 
-        let Ok(audio_resp) = get_req.send().await else {
+        let Ok(mut audio_resp) = get_req.send().await else {
             continue;
         };
 
@@ -1589,27 +1985,62 @@ async fn try_fetch_innertube_audio(
             continue;
         }
 
-        if let Ok(bytes) = audio_resp.bytes().await {
-            if bytes.len() > 16_384 {
-                let mut vec_data = bytes.to_vec();
-                if vec_data.len() > max_bytes {
-                    vec_data.truncate(max_bytes);
+        let initial_cap = audio_resp
+            .content_length()
+            .map(|n| (n as usize).min(max_bytes))
+            .unwrap_or(1024 * 1024);
+        let mut vec_data = Vec::with_capacity(initial_cap);
+        let mut read_ok = true;
+
+        loop {
+            if is_stream_cancelled(&generation_pair, &cancel_flag, None) {
+                return Err(CANCELLED_ERR_MSG.to_string());
+            }
+            match audio_resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    let remaining = max_bytes.saturating_sub(vec_data.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    if chunk.len() >= remaining {
+                        vec_data.extend_from_slice(&chunk[..remaining]);
+                        break;
+                    }
+                    vec_data.extend_from_slice(&chunk);
                 }
-                let prog_buf = ProgressiveAudioBuffer::from_vec(vec_data);
-                if Decoder::new(prog_buf.reader()).is_ok() {
-                    let quality_label = if auth.is_some_and(|a| a.is_authenticated) {
-                        format!("128 kbps M4A ({} • Autenticado na RAM)", profile.name)
-                    } else {
-                        format!("128 kbps M4A ({} • YouTube Stream RAM)", profile.name)
-                    };
-                    return Ok(ExtractedAudio {
-                        data: prog_buf,
-                        duration_secs: duration_secs.max(1.0),
-                        quality_label,
-                        title,
-                        author,
-                    });
+                Ok(None) => break,
+                Err(_) => {
+                    read_ok = false;
+                    break;
                 }
+            }
+        }
+
+        if read_ok && vec_data.len() > 16_384 {
+            vec_data.shrink_to_fit();
+            let prog_buf = ProgressiveAudioBuffer::from_vec(vec_data);
+            let probe_buf = prog_buf.clone();
+            let probe_ok =
+                tokio::task::spawn_blocking(move || Decoder::new(probe_buf.reader()).is_ok())
+                    .await
+                    .unwrap_or(false);
+            if probe_ok {
+                if is_stream_cancelled(&generation_pair, &cancel_flag, None) {
+                    return Err(CANCELLED_ERR_MSG.to_string());
+                }
+                let quality_label = if auth.is_some_and(|a| a.is_authenticated) {
+                    format!("128 kbps M4A ({} • Autenticado na RAM)", profile.name)
+                } else {
+                    format!("128 kbps M4A ({} • YouTube Stream RAM)", profile.name)
+                };
+                return Ok(ExtractedAudio {
+                    data: prog_buf,
+                    duration_secs: duration_secs.max(1.0),
+                    quality_label,
+                    title,
+                    author,
+                    cancel_flag,
+                });
             }
         }
     }
@@ -1788,6 +2219,12 @@ mod tests {
             parse_mp4_sidx_metadata(&sidx_v1).expect("valid v1 sidx box should parse");
         assert_eq!(v1_bytes, (sidx_v1.len() as u64) + 512 + 4096);
         assert!((v1_dur - 2.0).abs() < 1e-6);
+
+        // Extreme u64::MAX first_offset saturates safely without integer overflow panic
+        let sidx_huge = build_sidx_v1(48_000, 0, u64::MAX, &[(4096, 48_000)]);
+        let (huge_bytes, _) =
+            parse_mp4_sidx_metadata(&sidx_huge).expect("huge first_offset should saturate");
+        assert_eq!(huge_bytes, u64::MAX);
 
         // Timescale == 0 should safely return 0.0 duration without NaN/Inf
         let zero_ts = build_sidx_v0(0, 0, 0, &[(1024, 1000)]);
@@ -1978,6 +2415,7 @@ mod tests {
         let gh =
             reqwest::Url::parse("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp")
                 .unwrap();
+        let gh_sums = reqwest::Url::parse(YT_DLP_SHA256SUMS_URL).unwrap();
         let gh_cdn = reqwest::Url::parse(
             "https://objects.githubusercontent.com/github-production-release-asset/123",
         )
@@ -1988,9 +2426,51 @@ mod tests {
         let evil = reqwest::Url::parse("https://evil.example.com/yt-dlp").unwrap();
 
         assert!(is_trusted_yt_dlp_download_url(&gh));
+        assert!(is_trusted_yt_dlp_download_url(&gh_sums));
         assert!(is_trusted_yt_dlp_download_url(&gh_cdn));
         assert!(is_trusted_yt_dlp_download_url(&gh_release_assets));
         assert!(!is_trusted_yt_dlp_download_url(&http_gh));
         assert!(!is_trusted_yt_dlp_download_url(&evil));
+    }
+
+    #[test]
+    fn test_sha256_verification_and_stderr_sanitization() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let digest = sha256_hex(b"abc");
+        assert_eq!(digest.len(), 64);
+        assert_eq!(
+            digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let sums = format!(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  yt-dlp.exe\n\
+             {}  *yt-dlp_linux\n\
+             malformed_line_only_one_token\n",
+            digest.to_uppercase()
+        );
+        assert_eq!(
+            parse_sha256sums_for_asset(&sums, "yt-dlp_linux").as_deref(),
+            Some(digest.as_str())
+        );
+        assert_eq!(
+            parse_sha256sums_for_asset(&sums, "yt-dlp.exe").as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(parse_sha256sums_for_asset(&sums, "yt-dlp_macos"), None);
+
+        let fake_cookie = PathBuf::from("/tmp/secret/cookies.123.tmp.txt");
+        let raw_err = format!(
+            "ERROR: failed reading {} because {}",
+            fake_cookie.display(),
+            "é".repeat(400)
+        );
+        let cleaned = sanitize_yt_dlp_stderr(&raw_err, Some(&fake_cookie));
+        assert!(!cleaned.contains("/tmp/secret/cookies.123.tmp.txt"));
+        assert!(cleaned.contains("[cookies]"));
+        assert!(cleaned.chars().count() <= 300);
     }
 }

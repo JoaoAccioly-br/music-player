@@ -258,7 +258,7 @@ fn skip_back_a_tiny_bit(
     frac -= 0.0001;
     if frac < 0.0 {
         seconds = seconds.saturating_sub(1);
-        frac = 1.0 - frac;
+        frac = 1.0 + frac;
     }
     Time { seconds, frac }
 }

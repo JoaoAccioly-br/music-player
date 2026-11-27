@@ -37,9 +37,16 @@ const tabs: Array<{ id: RightPanelTab; label: string }> = [
   { id: 'related', label: 'Relacionados' },
 ]
 
-const activeLyricIndex = computed(() =>
-  computeActiveLyricIndex(player.lyrics, player.positionSecs, player.durationSecs)
+const isLyricsVisible = computed(
+  () =>
+    player.rightPanelTab === 'lyrics' &&
+    (props.embedded || (player.rightPanelOpen && !player.isFullscreenPlayer))
 )
+
+const activeLyricIndex = computed(() => {
+  if (!isLyricsVisible.value) return -1
+  return computeActiveLyricIndex(player.lyrics, player.positionSecs, player.durationSecs)
+})
 
 const lyricLineEls = new Map<number, HTMLElement>()
 function setLyricLineRef(el: unknown, idx: number) {
@@ -51,8 +58,7 @@ function setLyricLineRef(el: unknown, idx: number) {
 }
 
 async function scrollActiveLyricIntoView(idx: number) {
-  const isVisible = (props.embedded || player.rightPanelOpen) && player.rightPanelTab === 'lyrics'
-  if (idx < 0 || !isVisible) return
+  if (idx < 0 || !isLyricsVisible.value) return
   await nextTick()
   lyricLineEls.get(idx)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
@@ -61,14 +67,11 @@ watch(activeLyricIndex, (idx) => {
   scrollActiveLyricIntoView(idx)
 })
 
-watch(
-  () => [player.rightPanelTab, player.rightPanelOpen, props.embedded] as const,
-  ([tab, open, embedded]) => {
-    if ((embedded || open) && tab === 'lyrics' && activeLyricIndex.value >= 0) {
-      scrollActiveLyricIntoView(activeLyricIndex.value)
-    }
+watch(isLyricsVisible, (visible) => {
+  if (visible && activeLyricIndex.value >= 0) {
+    scrollActiveLyricIntoView(activeLyricIndex.value)
   }
-)
+})
 
 function seekToLyricLine(lineIdx: number) {
   const timed = player.lyrics?.timedLines ?? []

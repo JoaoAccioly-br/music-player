@@ -11,13 +11,25 @@ pub const FIREFOX_LINUX_UA: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0";
 
 /// Internal session persisted to `~/.local/share/com.ytmusic.rust/auth.json` with `0600` permissions.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct AuthSession {
     pub is_authenticated: bool,
     pub cookie_header: String,
     pub sapisid: String,
     pub auth_method: String,
     pub updated_at: u64,
+}
+
+impl std::fmt::Debug for AuthSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthSession")
+            .field("is_authenticated", &self.is_authenticated)
+            .field("cookie_header", &"[REDACTED]")
+            .field("sapisid", &"[REDACTED]")
+            .field("auth_method", &self.auth_method)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 /// Safe public status sent to the Vue 3 frontend (masks raw cookies while exposing status and preview).
@@ -33,12 +45,11 @@ pub struct AuthStatus {
 
 impl AuthSession {
     pub fn to_status(&self) -> AuthStatus {
-        let preview = if self.sapisid.len() > 8 {
-            format!(
-                "{}...{}",
-                &self.sapisid[..4],
-                &self.sapisid[self.sapisid.len() - 4..]
-            )
+        let char_count = self.sapisid.chars().count();
+        let preview = if char_count > 8 {
+            let prefix: String = self.sapisid.chars().take(4).collect();
+            let suffix: String = self.sapisid.chars().skip(char_count - 4).collect();
+            format!("{prefix}...{suffix}")
         } else if !self.sapisid.is_empty() {
             "***".to_string()
         } else {
@@ -258,7 +269,7 @@ pub fn save_session_to_disk(session: &AuthSession) -> Result<(), String> {
     {
         use std::fs::OpenOptions;
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -266,6 +277,8 @@ pub fn save_session_to_disk(session: &AuthSession) -> Result<(), String> {
             .mode(0o600)
             .open(&path)
             .map_err(|e| format!("Falha ao abrir arquivo de sessão protegido: {e}"))?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Falha ao aplicar permissão 0600 ao arquivo de sessão: {e}"))?;
         file.write_all(serialized.as_bytes())
             .map_err(|e| format!("Falha ao gravar arquivo de sessão: {e}"))?;
     }
@@ -300,7 +313,25 @@ pub fn build_session_from_cookie_str(
         );
     };
 
+    if sapisid.is_empty() || sapisid.chars().any(|c| !c.is_ascii_graphic() || c == ';') {
+        return Err(
+            "Token SAPISID inválido: contém caracteres de controle, espaços ou caracteres não-ASCII."
+                .to_string(),
+        );
+    }
+
     let normalized_header = normalize_cookie_header(cookie_str, &sapisid);
+    if normalized_header.contains('\r')
+        || normalized_header.contains('\n')
+        || normalized_header.contains('\0')
+        || reqwest::header::HeaderValue::from_str(&normalized_header).is_err()
+    {
+        return Err(
+            "Cabeçalho Cookie inválido: contém quebras de linha ou caracteres não permitidos em cabeçalhos HTTP."
+                .to_string(),
+        );
+    }
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0))
@@ -315,13 +346,11 @@ pub fn build_session_from_cookie_str(
     })
 }
 
-/// Opens a temporary secondary WebView window (`"google-login"`) pointing to Google Login -> YouTube Music.
-/// Uses a clean Firefox Linux Desktop User-Agent to avoid Google's embedded browser block on WebKitGTK,
-/// restricts navigation to verified Google / YouTube domains, and starts a background cookie watcher
-/// that automatically captures `SAPISID`, saves `auth.json` (`0600`), and destroys the login WebView
-/// as soon as login completes to free 100% of its RAM!
-/// Validates whether a URL belongs to the Google / YouTube login navigation allowlist.
+/// Validates whether a URL belongs to the HTTPS Google / YouTube login navigation allowlist.
 pub fn is_allowed_login_navigation_url(url: &tauri::Url) -> bool {
+    if url.scheme() != "https" {
+        return false;
+    }
     let host = url.host_str().unwrap_or("");
     host == "accounts.google.com"
         || host.ends_with(".google.com")
@@ -330,6 +359,11 @@ pub fn is_allowed_login_navigation_url(url: &tauri::Url) -> bool {
         || host.ends_with(".youtube.com")
 }
 
+/// Opens a temporary secondary incognito WebView window (`"google-login"`) pointing to Google Login -> YouTube Music.
+/// Uses a clean Firefox Linux Desktop User-Agent to avoid Google's embedded browser block on WebKitGTK,
+/// restricts navigation to verified HTTPS Google / YouTube domains, isolates cookies in incognito mode
+/// so logout truly clears the session, and starts a background cookie watcher that automatically captures
+/// `SAPISID`, saves `auth.json` (`0600`), and destroys the login WebView as soon as login completes to free 100% of its RAM!
 pub fn open_google_login_window(app: &AppHandle) -> Result<(), String> {
     if let Some(existing) = app.get_webview_window("google-login") {
         let _ = existing.show();
@@ -346,6 +380,7 @@ pub fn open_google_login_window(app: &AppHandle) -> Result<(), String> {
             .title("Conectar Conta Google — YouTube Music (Janela Temporária Zero-RAM)")
             .inner_size(520.0, 680.0)
             .resizable(true)
+            .incognito(true)
             .user_agent(FIREFOX_LINUX_UA)
             .on_navigation(|url| is_allowed_login_navigation_url(url))
             .build()
@@ -417,13 +452,17 @@ fn spawn_login_cookie_watcher(app: AppHandle) {
 
             if has_login_cookie {
                 if let Ok(session) = build_session_from_cookie_str(&combined, "webview") {
-                    let _ = save_session_to_disk(&session);
+                    let session_for_disk = session.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        save_session_to_disk(&session_for_disk)
+                    })
+                    .await;
                     let status = session.to_status();
 
                     if let Some(container) = app.try_state::<crate::AppContainer>() {
-                        if let Ok(mut auth_guard) = container.auth.lock() {
-                            *auth_guard = session;
-                        }
+                        let mut auth_guard =
+                            container.auth.lock().unwrap_or_else(|e| e.into_inner());
+                        *auth_guard = session;
                     }
 
                     let _ = app.emit("auth-state-changed", &status);
@@ -443,8 +482,7 @@ mod tests {
     #[test]
     fn test_extract_sapisid_from_cookie_formats() {
         assert_eq!(extract_sapisid_from_cookie(""), None);
-        assert_eq!(extract_sapisid_from_cookie("   
-	  "), None);
+        assert_eq!(extract_sapisid_from_cookie("   \n\t  "), None);
         assert_eq!(extract_sapisid_from_cookie("SID=abc; HSID=def"), None);
         assert_eq!(extract_sapisid_from_cookie("shorttoken"), None);
 
@@ -470,11 +508,7 @@ mod tests {
         );
 
         // Netscape cookies.txt format (ignoring comments & blank lines)
-        let netscape = "# Netscape HTTP Cookie File
-
-.youtube.com	TRUE	/	TRUE	2147483647	SID	sid_val
-.youtube.com	TRUE	/	TRUE	2147483647	SAPISID	netscape_sapisid_999
-";
+        let netscape = "# Netscape HTTP Cookie File\n\n.youtube.com\tTRUE\t/\tTRUE\t2147483647\tSID\tsid_val\n.youtube.com\tTRUE\t/\tTRUE\t2147483647\tSAPISID\tnetscape_sapisid_999\n";
         assert_eq!(
             extract_sapisid_from_cookie(netscape),
             Some("netscape_sapisid_999".to_string())
@@ -496,14 +530,14 @@ mod tests {
         assert!(normalized_raw.contains("__Secure-1PAPISID=RawToken1234567890"));
 
         // Standard header missing __Secure-3PAPISID gets it appended
-        let normalized_hdr = normalize_cookie_header("Cookie: SID=1; SAPISID=tok123456789012", "tok123456789012");
+        let normalized_hdr =
+            normalize_cookie_header("Cookie: SID=1; SAPISID=tok123456789012", "tok123456789012");
         assert!(normalized_hdr.contains("SID=1"));
         assert!(normalized_hdr.contains("SAPISID=tok123456789012"));
         assert!(normalized_hdr.contains("__Secure-3PAPISID=tok123456789012"));
 
         // Netscape format converts to `; `-separated HTTP Cookie header
-        let netscape = ".youtube.com	TRUE	/	TRUE	2147483647	SID	sid1
-.youtube.com	TRUE	/	TRUE	2147483647	SAPISID	net_tok_12345678";
+        let netscape = ".youtube.com\tTRUE\t/\tTRUE\t2147483647\tSID\tsid1\n.youtube.com\tTRUE\t/\tTRUE\t2147483647\tSAPISID\tnet_tok_12345678";
         let normalized_ns = normalize_cookie_header(netscape, "net_tok_12345678");
         assert!(normalized_ns.contains("SID=sid1"));
         assert!(normalized_ns.contains("SAPISID=net_tok_12345678"));
@@ -525,7 +559,30 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_status_preview_for_short_and_empty_sapisid() {
+    fn test_build_session_rejects_crlf_control_chars_and_non_ascii() {
+        assert!(build_session_from_cookie_str(
+            "SAPISID=abcd1234efgh5678\r\nX-Evil: injected",
+            "manual"
+        )
+        .is_err());
+        assert!(build_session_from_cookie_str(
+            "SID=val\r\nX-Injected: 1; SAPISID=abcd1234efgh5678",
+            "manual"
+        )
+        .is_err());
+        assert!(
+            build_session_from_cookie_str("SAPISID=abcd1234\0efgh5678; SID=1", "manual").is_err()
+        );
+        assert!(
+            build_session_from_cookie_str("SAPISID=abcd 1234efgh5678; SID=1", "manual").is_err()
+        );
+        assert!(
+            build_session_from_cookie_str("SAPISID=éééé1234efgh5678; SID=1", "manual").is_err()
+        );
+    }
+
+    #[test]
+    fn test_auth_status_preview_for_short_utf8_and_empty_sapisid_and_debug_redaction() {
         let short_session = AuthSession {
             is_authenticated: true,
             cookie_header: "SAPISID=short12".to_string(),
@@ -536,6 +593,21 @@ mod tests {
         let status = short_session.to_status();
         assert_eq!(status.sapisid_preview, "***");
         assert_eq!(status.account_hint, "SAPISID (***)");
+
+        let debug_str = format!("{short_session:?}");
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(!debug_str.contains("short12"));
+
+        // Multi-byte UTF-8 sapisid must never panic on char boundary slicing
+        let utf8_session = AuthSession {
+            is_authenticated: true,
+            cookie_header: "SAPISID=áéíóú12345".to_string(),
+            sapisid: "áéíóú12345".to_string(),
+            auth_method: "manual".to_string(),
+            updated_at: 101,
+        };
+        let utf8_status = utf8_session.to_status();
+        assert_eq!(utf8_status.sapisid_preview, "áéíó...2345");
 
         let empty_status = AuthSession::default().to_status();
         assert!(!empty_status.is_authenticated);
@@ -593,6 +665,9 @@ mod tests {
         }
 
         let blocked = [
+            "http://accounts.google.com/ServiceLogin",
+            "http://music.youtube.com/",
+            "http://www.youtube.com/signin",
             "https://evil.com/login",
             "https://google.com.evil.com/",
             "https://youtube.com.attacker.org/",

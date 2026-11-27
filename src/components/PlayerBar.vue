@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref } from 'vue'
 import {
   AlertCircle,
   ChevronUp,
@@ -62,9 +62,17 @@ function handleVolumeInput(event: Event) {
   player.volume = val
   if (volumeDebounceTimer) clearTimeout(volumeDebounceTimer)
   volumeDebounceTimer = setTimeout(() => {
+    volumeDebounceTimer = null
     player.setVolume(val)
   }, 40)
 }
+
+onUnmounted(() => {
+  if (volumeDebounceTimer) {
+    clearTimeout(volumeDebounceTimer)
+    volumeDebounceTimer = null
+  }
+})
 
 function handleSeekStart() {
   isSeeking.value = true
@@ -325,8 +333,8 @@ function toggleMute() {
       <!-- Integrated Bottom Progress Bar inside the Pill -->
       <div class="mt-2 relative w-full h-1 rounded-full bg-white/12 overflow-hidden flex items-center">
         <div
-          class="h-full bg-gradient-to-r from-[#8B6EFF] to-[#D9C2FF] rounded-full transition-all duration-150"
-          :style="{ width: `${progressPercent}%` }"
+          class="w-full h-full bg-gradient-to-r from-[#8B6EFF] to-[#D9C2FF] rounded-full origin-left transition-transform duration-150 will-change-transform"
+          :style="{ transform: `scaleX(${progressPercent / 100})` }"
         ></div>
         <input
           type="range"
